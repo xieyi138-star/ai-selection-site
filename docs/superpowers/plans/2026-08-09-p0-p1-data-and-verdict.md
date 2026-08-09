@@ -2932,7 +2932,9 @@ import pytest
 from aisel.scoring.axes import rate_all, rate_axis
 
 TH = {
-    "adoption":               {"strong": 100000.0, "moderate": 10000.0},
+    "adoption_pypi":          {"strong": 100000.0, "moderate": 10000.0},
+    "adoption_npm":           {"strong": 500000.0, "moderate": 50000.0},
+    "adoption_docker":        {"strong": 1000000.0, "moderate": 100000.0},  # cumulative
     "alive_release":          {"strong": 30.0, "moderate": 120.0},  # days, lower better
     "alive_commits":          {"strong": 50.0, "moderate": 10.0},   # commits/90d, higher
     "alive_bus":              {"strong": 5.0, "moderate": 2.0},     # contributors, higher
@@ -2941,8 +2943,30 @@ TH = {
 }
 
 
-def test_adoption_uses_max_of_available_download_signals():
-    m = {"downloads_pypi_30d": 5000.0, "downloads_npm_30d": 250000.0}
+def test_adoption_takes_the_strongest_channel_not_the_weakest():
+    """Asymmetric with `alive` on purpose: alive is about failure modes, so any
+    dead vital sign disqualifies; adoption is about evidence of use, and being
+    huge on one channel is not diluted by being small on another."""
+    m = {"downloads_pypi_30d": 5000.0,      # weak on its own band
+         "downloads_npm_30d": 900000.0}     # strong on its own band
+    assert rate_all(m, run_status=None, thresholds=TH)["adoption"] == "strong"
+
+
+def test_each_channel_is_judged_against_its_own_band():
+    """500k npm downloads is 'strong'; the same number of pypi downloads would
+    also be strong — but the bands differ, so a shared band would misjudge one
+    of them. Docker is cumulative and needs its own band most of all."""
+    npm_only = {"downloads_npm_30d": 60000.0}    # above npm moderate, below strong
+    pypi_only = {"downloads_pypi_30d": 60000.0}  # same number, pypi band -> moderate
+    assert rate_all(npm_only, run_status=None, thresholds=TH)["adoption"] == "moderate"
+    assert rate_all(pypi_only, run_status=None, thresholds=TH)["adoption"] == "moderate"
+
+
+def test_docker_only_repos_still_get_an_adoption_rating():
+    """Measured 2026-08-09: 8 of 40 roster repos publish only a Docker image,
+    including nearly the whole vector-db stage. Ignoring the channel would leave
+    that stage page with no primary pick at all."""
+    m = {"dockerhub_pulls_total": 4200000.0}
     assert rate_all(m, run_status=None, thresholds=TH)["adoption"] == "strong"
 
 
@@ -3057,7 +3081,16 @@ NO_SAMPLE = -1.0
 # injected-threshold tests would never catch it. Fail loudly instead.
 THRESHOLDS: dict[str, dict[str, float]] | None = None
 
-DOWNLOAD_METRICS = ("downloads_pypi_30d", "downloads_npm_30d")
+# (metric, threshold band) per distribution channel. Each channel is banded
+# separately because the units are not comparable: pypi/npm are 30-day install
+# counts, dockerhub_pulls_total is cumulative since the image first existed.
+# A band therefore means "high relative to peers on the same channel", which is
+# a fair comparison; a shared band would not be.
+DOWNLOAD_CHANNELS = (
+    ("downloads_pypi_30d", "adoption_pypi"),
+    ("downloads_npm_30d", "adoption_npm"),
+    ("dockerhub_pulls_total", "adoption_docker"),
+)
 
 # Canonical band ordering. Task 14's verdict ranking imports this rather than
 # defining its own copy — two orderings that could drift apart is a bug waiting.
@@ -3074,6 +3107,18 @@ def _worst(bands: list[str]) -> str:
     if not present:
         return UNKNOWN
     return min(present, key=lambda b: BAND_RANK[b])
+
+
+def _best(bands: list[str]) -> str:
+    """Adoption takes the strongest channel, unlike `alive` which takes the
+    weakest. The asymmetry is deliberate: `alive` is about failure modes, so any
+    dead vital sign disqualifies; adoption is about evidence of use, and a
+    library that is huge on PyPI is not less adopted for shipping no image.
+    """
+    present = [b for b in bands if b != UNKNOWN]
+    if not present:
+        return UNKNOWN
+    return max(present, key=lambda b: BAND_RANK[b])
 
 
 def rate_axis(value: float, band: dict[str, float], lower_better: bool) -> str:
@@ -3119,11 +3164,14 @@ def rate_all(metrics: dict[str, float], run_status: str | None,
             "axis thresholds are not calibrated — run scripts/calibrate.py and "
             "set THRESHOLDS in aisel/scoring/axes.py (plan Task 12 Step 5)")
 
-    downloads = [metrics[k] for k in DOWNLOAD_METRICS if k in metrics]
-    if downloads:
-        adoption = rate_axis(max(downloads), th["adoption"], lower_better=False)
-    else:
-        adoption = UNKNOWN
+    # Measured 2026-08-09: 8 of the 40 roster repos publish ONLY a Docker image —
+    # pgvector, qdrant, milvus, weaviate and typesense among them, i.e. nearly the
+    # entire vector-db stage. Banding only pypi/npm would leave that stage page
+    # with no measurable adoption at all and therefore no primary pick.
+    adoption = _best([
+        rate_axis(metrics[metric], th[band], lower_better=False)
+        for metric, band in DOWNLOAD_CHANNELS if metric in metrics
+    ])
 
     # Spec §4.2: the "alive" axis has three vital signs, not one.
     alive_parts: list[str] = []
@@ -3188,7 +3236,7 @@ import statistics
 from aisel.collectors.github_activity import NEVER_RELEASED
 from aisel.db import get_engine, session_scope
 from aisel.models import Repo
-from aisel.scoring.axes import DOWNLOAD_METRICS, NO_SAMPLE, latest_metrics
+from aisel.scoring.axes import NO_SAMPLE, latest_metrics
 
 # Sentinels mean "no measurement", not "a very large/small measurement".
 # Feeding 9999.0 into a quantile would drag p75 to nonsense and silently
@@ -3196,7 +3244,10 @@ from aisel.scoring.axes import DOWNLOAD_METRICS, NO_SAMPLE, latest_metrics
 SENTINELS = {NO_SAMPLE, NEVER_RELEASED}
 
 AXES = {
-    "adoption           (max downloads_30d, higher better)": DOWNLOAD_METRICS,
+    "adoption_pypi      (downloads_pypi_30d, higher better)": ("downloads_pypi_30d",),
+    "adoption_npm       (downloads_npm_30d, higher better)": ("downloads_npm_30d",),
+    "adoption_docker    (dockerhub_pulls_total, CUMULATIVE, higher better)":
+        ("dockerhub_pulls_total",),
     "alive_release      (days_since_last_release, lower better)":
         ("days_since_last_release",),
     "alive_commits      (commits_90d, higher better)": ("commits_90d",),
@@ -3265,9 +3316,11 @@ if __name__ == "__main__":
 
 Run: `AISEL_DB_URL=sqlite:///data/aisel.db python scripts/calibrate.py`
 
-**定阈值规则（六个轴一律照此，不允许逐轴拍脑袋）：**
-- 「越大越好」（`adoption`、`alive_commits`、`alive_bus`、`responsive_close_ratio`）：`strong = p75`，`moderate = p25`
+**定阈值规则（八个 band 一律照此，不允许逐个拍脑袋）：**
+- 「越大越好」（`adoption_pypi`、`adoption_npm`、`adoption_docker`、`alive_commits`、`alive_bus`、`responsive_close_ratio`）：`strong = p75`，`moderate = p25`
 - 「越小越好」（`alive_release`、`responsive_latency`）：`strong = p25`，`moderate = p75`
+
+⚠️ 三个 adoption band 必须**各自**用自己那一列数据标定，不许共用。pypi/npm 是 30 天安装数、docker 是自镜像诞生以来的累计数——量纲不同。各自标定后，`strong` 的含义是「在同一渠道内相对同侪靠前」，这是公平比较；共用一档不是。
 
 ⚠️ `sentinel-excluded` 计数不为 0 时要看一眼：它表示有多少 repo 在这一轴上**根本没有测量值**（从未发过 release、90 天内无人回复 issue）。这些 repo 在该轴上会被判为 `unknown`，不是被判为差——这正是置信度分级要处理的情况，不要试图给它们编一个数。
 
