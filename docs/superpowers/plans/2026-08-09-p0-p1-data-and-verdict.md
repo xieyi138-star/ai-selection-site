@@ -21,7 +21,9 @@
 - **本机无 Docker**（实测 `docker` not found）。所有 quickstart 实跑只在 GitHub Actions `ubuntu-latest` runner 上执行，该 runner 预装 Docker。**任何任务都不得要求本地起容器。**
 - 所有时间戳一律 **UTC**，数据库中存 naive UTC datetime。
 - `metrics_daily` 写入必须**幂等**：唯一键 `(repo_id, date, metric)`，重复运行覆盖而非追加。
-- 网络请求一律经 `collectors/base.py` 的 `request_json` 重试包装。**唯一例外**：需要读取 HTTP 响应头（如 `Link` 分页头）时可直接用注入的 `client`，此时必须在代码注释里写明原因——目前仅 `github_activity._commits_in_window` 一处。
+- 网络请求一律经 `collectors/base.py` 的重试包装：要 JSON 用 `request_json`，要响应头（如 `Link` 分页头）用 `request_with_retry`。
+  **禁止任何绕过重试的裸 `client` 调用。** 理由不是洁癖：P0 关口要求**连续 7 天无缺口**，任一 repo 在某天因一次未重试的瞬时 5xx 而采集失败，就是当日缺口，7 天时钟从头开始。一次 502 的代价是一周。
+- **测不到就不许猜。** 解析外部响应时，「格式不符合预期」必须抛异常，不得退回一个看起来合理的默认值。合理的默认值会被当成测量结果写进 `metrics_daily`，违反 `CONSTITUTION.md` 规则 2。单个 repo 抛异常是安全的——`pipeline.run` 逐 repo 隔离，只丢那一个、次日重试。
 - **置信度必须随每条 verdict 输出**；`confidence == "low"` 的条目**禁止**取得 `recommendation == "primary"`。此约束由 Task 14 的测试强制。
 - 首批范围固定：**5 个环节 × 6–10 候选 = 40 repo**；**Top 20 = 每环节前 4**。
 - 密钥只从环境变量读，`.env` 进 `.gitignore`，仓库内只留 `.env.example`。
@@ -722,7 +724,8 @@ git commit -m "feat: repo roster config with validation and db sync"
 **Interfaces:**
 - Consumes: `aisel.models`（Task 1）
 - Produces:
-  - `aisel.collectors.base.request_json(client, method, url, **kw) -> dict | list`（带重试）
+  - `aisel.collectors.base.request_with_retry(client, method, url, max_attempts=4, backoff=1.0, **kw) -> httpx.Response`（带重试，返回原始 Response，供需要响应头的调用方）
+  - `aisel.collectors.base.request_json(client, method, url, **kw) -> dict | list`（`request_with_retry` 的薄封装，取 `.json()`）
   - `aisel.collectors.base.write_metrics(engine, repo_id, date, values: dict[str, float]) -> None`（幂等）
   - `aisel.collectors.github_activity.collect(client, owner, name) -> dict[str, float]`，返回键：`stars_total` `forks_total` `commits_90d` `days_since_last_release` `contributors_90d`
 
@@ -735,9 +738,20 @@ import httpx
 import pytest
 import respx
 
-from aisel.collectors.base import request_json, write_metrics
+from aisel.collectors.base import request_json, request_with_retry, write_metrics
 from aisel.db import get_engine, init_db, session_scope
 from aisel.models import MetricDaily, Repo, UseCase
+
+
+@respx.mock
+def test_request_with_retry_returns_the_response_so_headers_survive():
+    """Callers that need pagination headers must not have to bypass retry."""
+    respx.get("https://api.example/z").mock(return_value=httpx.Response(
+        200, json={"ok": True}, headers={"Link": '<https://x>; rel="last"'}))
+    with httpx.Client() as c:
+        resp = request_with_retry(c, "GET", "https://api.example/z")
+    assert resp.headers["Link"] == '<https://x>; rel="last"'
+    assert resp.json() == {"ok": True}
 
 
 @respx.mock
@@ -806,20 +820,34 @@ from aisel.models import MetricDaily
 RETRY_STATUS = {429, 500, 502, 503, 504}
 
 
-def request_json(client: httpx.Client, method: str, url: str,
-                 max_attempts: int = 4, backoff: float = 1.0, **kwargs):
+def request_with_retry(client: httpx.Client, method: str, url: str,
+                       max_attempts: int = 4, backoff: float = 1.0,
+                       **kwargs) -> httpx.Response:
+    """Retrying request that returns the Response, for callers needing headers.
+
+    Nothing may bypass this: an unretried transient 5xx costs one repo a day of
+    data, which breaks the P0 gate's 7-consecutive-days requirement and restarts
+    the clock.
+    """
     last: httpx.Response | None = None
     for attempt in range(max_attempts):
         resp = client.request(method, url, **kwargs)
         if resp.status_code not in RETRY_STATUS:
             resp.raise_for_status()
-            return resp.json()
+            return resp
         last = resp
         if attempt < max_attempts - 1:
             time.sleep(backoff * (2 ** attempt))
     assert last is not None
     last.raise_for_status()
     raise RuntimeError("unreachable")
+
+
+def request_json(client: httpx.Client, method: str, url: str,
+                 max_attempts: int = 4, backoff: float = 1.0, **kwargs):
+    return request_with_retry(client, method, url,
+                              max_attempts=max_attempts, backoff=backoff,
+                              **kwargs).json()
 
 
 def write_metrics(engine: Engine, repo_id: int, date: dt.date,
@@ -844,12 +872,13 @@ def write_metrics(engine: Engine, repo_id: int, date: dt.date,
 - [ ] **Step 4: 跑测试确认通过**
 
 Run: `python -m pytest tests/test_base.py -v`
-Expected: 3 passed
+Expected: 4 passed
 
 - [ ] **Step 5: 写失败的测试 `tests/test_github_activity.py`**
 
 ```python
 import httpx
+import pytest
 import respx
 
 from aisel.collectors.github_activity import collect
@@ -902,7 +931,55 @@ def test_no_releases_yields_sentinel_and_single_page_commits_count_as_one():
     assert out["commits_90d"] == 1
     assert out["days_since_last_release"] == 9999.0  # sentinel: never released
     assert out["contributors_90d"] == 1
+
+
+@respx.mock
+def test_unparseable_link_header_raises_instead_of_guessing():
+    """A parse failure must not masquerade as "this repo had 1 commit".
+
+    Falling back to len(body) here would write a plausible wrong number into
+    metrics_daily as if it were measured — CONSTITUTION.md rule 2.
+    """
+    respx.get(f"{API}/repos/o/n").mock(return_value=httpx.Response(
+        200, json={"stargazers_count": 1, "forks_count": 0}))
+    respx.get(f"{API}/repos/o/n/commits", params__contains={"per_page": "1"}).mock(
+        return_value=httpx.Response(
+            200, json=[{"sha": "a"}],
+            headers={"Link": '<https://api.github.com/x>; rel="somethingelse"'}))
+    respx.get(f"{API}/repos/o/n/releases").mock(return_value=httpx.Response(200, json=[]))
+
+    with httpx.Client() as c:
+        with pytest.raises(ValueError, match="unparseable Link header"):
+            collect(c, "o", "n", today=__import__("datetime").date(2026, 8, 9))
+
+
+@respx.mock
+def test_commit_count_request_is_retried_on_transient_5xx(monkeypatch):
+    """Nothing may bypass retry: one unretried 5xx costs this repo all five
+    metrics for the day, which breaks the P0 gate's 7-consecutive-days run."""
+    import aisel.collectors.base as base
+    monkeypatch.setattr(base.time, "sleep", lambda _s: None)
+
+    respx.get(f"{API}/repos/o/n").mock(return_value=httpx.Response(
+        200, json={"stargazers_count": 1, "forks_count": 0}))
+    commits = respx.get(f"{API}/repos/o/n/commits",
+                        params__contains={"per_page": "1"}).mock(side_effect=[
+        httpx.Response(502),
+        httpx.Response(200, json=[{"sha": "a"}],
+                       headers={"Link": f'<{API}/x?page=7>; rel="last"'}),
+    ])
+    respx.get(f"{API}/repos/o/n/releases").mock(return_value=httpx.Response(200, json=[]))
+    respx.get(f"{API}/repos/o/n/commits", params__contains={"per_page": "100"}).mock(
+        return_value=httpx.Response(200, json=[{"author": {"login": "alice"}}]))
+
+    with httpx.Client() as c:
+        out = collect(c, "o", "n", today=__import__("datetime").date(2026, 8, 9))
+
+    assert commits.call_count == 2   # retried, not abandoned
+    assert out["commits_90d"] == 7
 ```
+
+> 若 `@respx.mock` 装饰器与 pytest 的 `monkeypatch` fixture 组合出问题，改用 `with respx.mock:` 上下文管理器写法即可——**要证明的东西不变**：该请求在 502 后重试且最终解析出 7。改了要在报告里写明。
 
 - [ ] **Step 6: 跑测试确认失败**
 
@@ -924,7 +1001,7 @@ import re
 
 import httpx
 
-from aisel.collectors.base import request_json
+from aisel.collectors.base import request_json, request_with_retry
 
 API = "https://api.github.com"
 WINDOW_DAYS = 90
@@ -935,14 +1012,24 @@ _LAST_PAGE = re.compile(r'[?&]page=(\d+)>;\s*rel="last"')
 
 
 def _commits_in_window(client: httpx.Client, owner: str, name: str, since: str) -> float:
-    resp = client.get(f"{API}/repos/{owner}/{name}/commits",
-                      params={"since": since, "per_page": 1})
-    resp.raise_for_status()
+    # Needs the raw Response: the count lives in the Link header, not the body.
+    # request_with_retry (not a bare client call) keeps retry parity — an
+    # unretried 5xx here would cost this repo all five metrics for the day.
+    resp = request_with_retry(client, "GET", f"{API}/repos/{owner}/{name}/commits",
+                              params={"since": since, "per_page": 1})
     link = resp.headers.get("Link", "")
+    if not link:
+        # With per_page=1 GitHub omits Link only for 0- or 1-commit windows,
+        # so the body length IS the count here.
+        return float(len(resp.json()))
     m = _LAST_PAGE.search(link)
     if m:
         return float(m.group(1))
-    return float(len(resp.json()))
+    # Header present but unparseable: a format change or a stripping proxy.
+    # Falling back to len(body) would report "1 commit" — a plausible, wrong,
+    # persisted measurement. Refuse to guess (CONSTITUTION.md rule 2).
+    raise ValueError(
+        f"unparseable Link header for {owner}/{name}: {link!r}")
 
 
 def _distinct_authors(client: httpx.Client, owner: str, name: str, since: str) -> float:
@@ -989,7 +1076,7 @@ def collect(client: httpx.Client, owner: str, name: str,
 - [ ] **Step 8: 跑测试确认通过**
 
 Run: `python -m pytest tests/test_github_activity.py -v`
-Expected: 2 passed
+Expected: 4 passed
 
 - [ ] **Step 9: 对真实 repo 手工验一次**
 
@@ -2538,9 +2625,11 @@ import pytest
 from aisel.scoring.axes import rate_all, rate_axis
 
 TH = {
-    "adoption": {"strong": 100000.0, "moderate": 10000.0},
-    "alive":    {"strong": 30.0, "moderate": 120.0},        # days since release, lower better
-    "responsive": {"strong": 24.0, "moderate": 168.0},      # hours, lower better
+    "adoption":      {"strong": 100000.0, "moderate": 10000.0},
+    "alive_release": {"strong": 30.0, "moderate": 120.0},   # days, lower better
+    "alive_commits": {"strong": 50.0, "moderate": 10.0},    # commits/90d, higher better
+    "alive_bus":     {"strong": 5.0, "moderate": 2.0},      # contributors/90d, higher better
+    "responsive":    {"strong": 24.0, "moderate": 168.0},   # hours, lower better
 }
 
 
@@ -2557,6 +2646,25 @@ def test_adoption_unknown_when_no_download_signal_exists():
 def test_alive_is_weak_when_release_is_ancient():
     m = {"days_since_last_release": 400.0, "commits_90d": 0.0}
     assert rate_all(m, run_status=None, thresholds=TH)["alive"] == "weak"
+
+
+def test_alive_takes_the_worst_vital_sign_not_the_best():
+    """Spec §4.2: alive has three vital signs. A fresh release with almost no
+    commits and a single maintainer is a release bot, not a healthy project —
+    taking the best or the average would hide exactly that."""
+    m = {"days_since_last_release": 5.0,   # strong
+         "commits_90d": 2.0,               # weak
+         "contributors_90d": 1.0}          # weak
+    assert rate_all(m, run_status=None, thresholds=TH)["alive"] == "weak"
+
+
+def test_alive_uses_only_the_vital_signs_that_are_present():
+    m = {"days_since_last_release": 5.0}
+    assert rate_all(m, run_status=None, thresholds=TH)["alive"] == "strong"
+
+
+def test_alive_unknown_when_no_vital_sign_present():
+    assert rate_all({}, run_status=None, thresholds=TH)["alive"] == "unknown"
 
 
 def test_responsive_unknown_when_sentinel_no_sample():
@@ -2621,6 +2729,22 @@ THRESHOLDS: dict[str, dict[str, float]] | None = None
 
 DOWNLOAD_METRICS = ("downloads_pypi_30d", "downloads_npm_30d")
 
+# Canonical band ordering. Task 14's verdict ranking imports this rather than
+# defining its own copy — two orderings that could drift apart is a bug waiting.
+BAND_RANK = {"unknown": 0, "weak": 1, "moderate": 2, "strong": 3}
+
+
+def _worst(bands: list[str]) -> str:
+    """A project is only as alive as its weakest vital sign.
+
+    Recent releases with no commits and a single maintainer is a release bot,
+    not a healthy project — averaging would hide exactly that.
+    """
+    present = [b for b in bands if b != UNKNOWN]
+    if not present:
+        return UNKNOWN
+    return min(present, key=lambda b: BAND_RANK[b])
+
 
 def rate_axis(value: float, band: dict[str, float], lower_better: bool) -> str:
     if lower_better:
@@ -2671,11 +2795,18 @@ def rate_all(metrics: dict[str, float], run_status: str | None,
     else:
         adoption = UNKNOWN
 
+    # Spec §4.2: the "alive" axis has three vital signs, not one.
+    alive_parts: list[str] = []
     if "days_since_last_release" in metrics:
-        alive = rate_axis(metrics["days_since_last_release"], th["alive"],
-                          lower_better=True)
-    else:
-        alive = UNKNOWN
+        alive_parts.append(rate_axis(metrics["days_since_last_release"],
+                                     th["alive_release"], lower_better=True))
+    if "commits_90d" in metrics:
+        alive_parts.append(rate_axis(metrics["commits_90d"],
+                                     th["alive_commits"], lower_better=False))
+    if "contributors_90d" in metrics:
+        alive_parts.append(rate_axis(metrics["contributors_90d"],
+                                     th["alive_bus"], lower_better=False))
+    alive = _worst(alive_parts)
 
     latency = metrics.get("issue_first_response_p50_hours", NO_SAMPLE)
     if latency == NO_SAMPLE:
@@ -2696,7 +2827,7 @@ def rate_all(metrics: dict[str, float], run_status: str | None,
 - [ ] **Step 4: 跑测试确认通过**
 
 Run: `python -m pytest tests/test_axes.py -v`
-Expected: 11 passed
+Expected: 14 passed
 
 - [ ] **Step 5: 写 `scripts/calibrate.py` 并用真实数据定阈值**
 
@@ -2708,14 +2839,22 @@ from __future__ import annotations
 import argparse
 import statistics
 
+from aisel.collectors.github_activity import NEVER_RELEASED
 from aisel.db import get_engine, session_scope
 from aisel.models import Repo
 from aisel.scoring.axes import DOWNLOAD_METRICS, NO_SAMPLE, latest_metrics
 
+# Sentinels mean "no measurement", not "a very large/small measurement".
+# Feeding 9999.0 into a quantile would drag p75 to nonsense and silently
+# produce thresholds nobody could defend.
+SENTINELS = {NO_SAMPLE, NEVER_RELEASED}
+
 AXES = {
-    "adoption (max downloads_30d, higher better)": DOWNLOAD_METRICS,
-    "alive (days_since_last_release, lower better)": ("days_since_last_release",),
-    "responsive (issue_first_response_p50_hours, lower better)":
+    "adoption      (max downloads_30d, higher better)": DOWNLOAD_METRICS,
+    "alive_release (days_since_last_release, lower better)": ("days_since_last_release",),
+    "alive_commits (commits_90d, higher better)": ("commits_90d",),
+    "alive_bus     (contributors_90d, higher better)": ("contributors_90d",),
+    "responsive    (issue_first_response_p50_hours, lower better)":
         ("issue_first_response_p50_hours",),
 }
 
@@ -2729,20 +2868,26 @@ def main() -> int:
     with session_scope(engine) as s:
         repo_ids = [r.id for r in s.query(Repo).all()]
 
+    snapshots = {rid: latest_metrics(engine, rid) for rid in repo_ids}
+
     for label, keys in AXES.items():
         values: list[float] = []
-        for rid in repo_ids:
-            m = latest_metrics(engine, rid)
-            present = [m[k] for k in keys if k in m and m[k] != NO_SAMPLE]
-            if present:
-                values.append(max(present) if len(keys) > 1 else present[0])
+        excluded = 0
+        for m in snapshots.values():
+            raw = [m[k] for k in keys if k in m]
+            usable = [v for v in raw if v not in SENTINELS]
+            if raw and not usable:
+                excluded += 1
+            if usable:
+                values.append(max(usable) if len(keys) > 1 else usable[0])
         if not values:
-            print(f"{label}: no data")
+            print(f"{label}: no data  (sentinel-only: {excluded})")
             continue
         values.sort()
         q = statistics.quantiles(values, n=4)
-        print(f"{label}\n  n={len(values)}  min={values[0]:.1f}  "
-              f"p25={q[0]:.1f}  p50={q[1]:.1f}  p75={q[2]:.1f}  max={values[-1]:.1f}")
+        print(f"{label}\n  n={len(values)}  sentinel-excluded={excluded}  "
+              f"min={values[0]:.1f}  p25={q[0]:.1f}  p50={q[1]:.1f}  "
+              f"p75={q[2]:.1f}  max={values[-1]:.1f}")
     return 0
 
 
@@ -2752,9 +2897,11 @@ if __name__ == "__main__":
 
 Run: `AISEL_DB_URL=sqlite:///data/aisel.db python scripts/calibrate.py`
 
-**定阈值规则（对所有轴一致，不允许逐轴拍脑袋）：**
-- 「越大越好」的轴：`strong = p75`，`moderate = p25`
-- 「越小越好」的轴：`strong = p25`，`moderate = p75`
+**定阈值规则（五个轴一律照此，不允许逐轴拍脑袋）：**
+- 「越大越好」的轴（`adoption`、`alive_commits`、`alive_bus`）：`strong = p75`，`moderate = p25`
+- 「越小越好」的轴（`alive_release`、`responsive`）：`strong = p25`，`moderate = p75`
+
+⚠️ `sentinel-excluded` 计数不为 0 时要看一眼：它表示有多少 repo 在这一轴上**根本没有测量值**（从未发过 release、90 天内无人回复 issue）。这些 repo 在该轴上会被判为 `unknown`，不是被判为差——这正是置信度分级要处理的情况，不要试图给它们编一个数。
 
 把 `axes.py` 里的 `THRESHOLDS = None` 替换为算出的三轴字典，并在该常量上方用注释记下标定日期与当时的 n 值。替换后 `test_uncalibrated_thresholds_raise_instead_of_silently_misrating` 仍须通过（它用 monkeypatch 强制置 None，不依赖模块初值）。
 
@@ -3010,10 +3157,9 @@ from sqlalchemy import Engine
 
 from aisel.db import session_scope
 from aisel.models import Repo, Verdict
-from aisel.scoring.axes import latest_metrics, latest_run_status, rate_all
+from aisel.scoring.axes import BAND_RANK, latest_metrics, latest_run_status, rate_all
 from aisel.scoring.confidence import grade
 
-BAND_ORDER = {"strong": 3, "moderate": 2, "weak": 1, "unknown": 0}
 AXES = ("adoption", "alive", "responsive")
 
 
@@ -3021,9 +3167,9 @@ def _sort_key(item: tuple[Repo, dict[str, str]]) -> tuple:
     repo, ratings = item
     strong = sum(ratings[a] == "strong" for a in AXES)
     return (-strong,
-            -BAND_ORDER[ratings["adoption"]],
-            -BAND_ORDER[ratings["alive"]],
-            -BAND_ORDER[ratings["responsive"]],
+            -BAND_RANK[ratings["adoption"]],
+            -BAND_RANK[ratings["alive"]],
+            -BAND_RANK[ratings["responsive"]],
             f"{repo.owner}/{repo.name}")
 
 
