@@ -10,7 +10,7 @@ import re
 
 import httpx
 
-from aisel.collectors.base import request_json
+from aisel.collectors.base import request_json, request_with_retry
 
 API = "https://api.github.com"
 WINDOW_DAYS = 90
@@ -21,16 +21,24 @@ _LAST_PAGE = re.compile(r'[?&]page=(\d+)>;\s*rel="last"')
 
 
 def _commits_in_window(client: httpx.Client, owner: str, name: str, since: str) -> float:
-    # Direct client.get (not request_json): we need response *headers* (Link),
-    # which the request_json wrapper discards after returning parsed JSON.
-    resp = client.get(f"{API}/repos/{owner}/{name}/commits",
-                      params={"since": since, "per_page": 1})
-    resp.raise_for_status()
+    # Needs the raw Response: the count lives in the Link header, not the body.
+    # request_with_retry (not a bare client call) keeps retry parity — an
+    # unretried 5xx here would cost this repo all five metrics for the day.
+    resp = request_with_retry(client, "GET", f"{API}/repos/{owner}/{name}/commits",
+                              params={"since": since, "per_page": 1})
     link = resp.headers.get("Link", "")
+    if not link:
+        # With per_page=1 GitHub omits Link only for 0- or 1-commit windows,
+        # so the body length IS the count here.
+        return float(len(resp.json()))
     m = _LAST_PAGE.search(link)
     if m:
         return float(m.group(1))
-    return float(len(resp.json()))
+    # Header present but unparseable: a format change or a stripping proxy.
+    # Falling back to len(body) would report "1 commit" — a plausible, wrong,
+    # persisted measurement. Refuse to guess (CONSTITUTION.md rule 2).
+    raise ValueError(
+        f"unparseable Link header for {owner}/{name}: {link!r}")
 
 
 def _distinct_authors(client: httpx.Client, owner: str, name: str, since: str) -> float:

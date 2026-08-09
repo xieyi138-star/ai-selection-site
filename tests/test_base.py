@@ -4,9 +4,20 @@ import httpx
 import pytest
 import respx
 
-from aisel.collectors.base import request_json, write_metrics
+from aisel.collectors.base import request_json, request_with_retry, write_metrics
 from aisel.db import get_engine, init_db, session_scope
 from aisel.models import MetricDaily, Repo, UseCase
+
+
+@respx.mock
+def test_request_with_retry_returns_the_response_so_headers_survive():
+    """Callers that need pagination headers must not have to bypass retry."""
+    respx.get("https://api.example/z").mock(return_value=httpx.Response(
+        200, json={"ok": True}, headers={"Link": '<https://x>; rel="last"'}))
+    with httpx.Client() as c:
+        resp = request_with_retry(c, "GET", "https://api.example/z")
+    assert resp.headers["Link"] == '<https://x>; rel="last"'
+    assert resp.json() == {"ok": True}
 
 
 @respx.mock
