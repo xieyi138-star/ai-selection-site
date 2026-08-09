@@ -1,6 +1,7 @@
 import datetime as dt
 
 import httpx
+import pytest
 import respx
 
 from aisel.collectors.github_issues import collect
@@ -65,3 +66,27 @@ def test_counts_closed_issues_in_window():
         out = collect(c, "o", "n", today=dt.date(2026, 8, 9))
 
     assert out["issues_closed_90d"] == 1.0
+
+
+@respx.mock
+def test_truncated_window_raises_rather_than_reporting_a_partial_count():
+    """Exhausting MAX_PAGES before reaching the cutoff means every count is an
+    undercount — and the surviving sample is the NEWEST issues, which are
+    systematically less likely to be closed, so the close ratio would be biased
+    downward exactly for the busiest repos. Measured 2026-08-09: vllm 1773
+    issues/90d, llama.cpp 1281, ollama 675.
+    """
+    import aisel.collectors.github_issues as gi
+
+    # Every page: full, entirely in-window, and claiming another page follows.
+    page = {"data": {"repository": {"issues": {
+        "nodes": [_issue("2026-08-01T00:00:00Z", "2026-08-01T02:00:00Z")
+                  for _ in range(gi.PAGE_SIZE)],
+        "pageInfo": {"hasNextPage": True, "endCursor": "c"}}}}}
+    route = respx.post(GQL).mock(return_value=httpx.Response(200, json=page))
+
+    with httpx.Client() as c:
+        with pytest.raises(RuntimeError, match="raise MAX_PAGES"):
+            collect(c, "o", "n", today=dt.date(2026, 8, 9))
+
+    assert route.call_count == gi.MAX_PAGES  # tried the full budget first
