@@ -3902,8 +3902,10 @@ GROUPS = [
 ]
 
 WINDOW_NOTE = (
-    "_Download figures are 30-day totals; trend window is 180 days "
-    "(pypistats retention). Quickstart results come from a clean container run._"
+    "_Download figures are 30-day install counts and include automated CI and "
+    "container builds — they are not a count of people. Mirror traffic is "
+    "excluded. Trend window is 180 days (pypistats retention). Quickstart "
+    "results come from a clean container run._"
 )
 
 
