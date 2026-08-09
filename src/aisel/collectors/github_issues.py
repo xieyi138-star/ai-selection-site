@@ -26,6 +26,12 @@ MAX_PAGES = 40
 PAGE_DELAY_S = 1.0
 NO_SAMPLE = -1.0
 
+# Why comments(first:5): we need the first comment by someone other than the
+# issue author, so the window only has to outlast a reporter's own follow-ups.
+# Measured 2026-08-09 across all 3,234 issues in the 90-day windows of langgraph,
+# vllm and llama.cpp: widening 5 -> 15 reclassifies 2 issues (0.19% of the
+# no-response bucket). Issues with 5+ leading author-only comments are rare
+# (0 / 0 / 3 respectively) and mostly never got an external reply anyway.
 QUERY = """
 query($owner:String!, $name:String!, $cursor:String) {
   repository(owner:$owner, name:$name) {
@@ -76,7 +82,14 @@ def collect(client: httpx.Client, owner: str, name: str,
             json={"query": QUERY,
                   "variables": {"owner": owner, "name": name, "cursor": cursor}},
         )
-        issues = payload["data"]["repository"]["issues"]
+        # GraphQL answers errors with HTTP 200 and a null payload, which would
+        # otherwise surface as a bare TypeError several frames away.
+        if payload.get("errors"):
+            raise RuntimeError(f"GraphQL error for {owner}/{name}: {payload['errors']}")
+        repository = (payload.get("data") or {}).get("repository")
+        if repository is None:
+            raise RuntimeError(f"GraphQL returned no repository for {owner}/{name}")
+        issues = repository["issues"]
         stop = False
         for issue in issues["nodes"]:
             if _ts(issue["createdAt"]) < cutoff:
