@@ -15,7 +15,8 @@
 ## Global Constraints
 
 - Python **3.12**（本机实测 3.12.10）。不使用 3.13+ 语法。
-- **数据库用 SQLite**，经 SQLAlchemy 2.x ORM 访问。规格 §11 写的是 Postgres；40 repo × 365 天 ≈ 1.5 万行，SQLite 完全够用且零安装。P2 建站时换 Postgres 只需改连接串。**代码中不得出现任何 SQLite 专有 SQL。**
+- **数据库用 SQLite**，经 SQLAlchemy 2.x ORM 访问。规格 §11 写的是 Postgres；40 repo × 365 天 ≈ 1.5 万行，SQLite 完全够用且零安装。P2 建站时换 Postgres 只需改连接串。**业务代码中不得出现任何 SQLite 专有 SQL。**
+  **例外**：为**消除方言行为差异**而做的连接期配置是允许且必需的，须按 `engine.dialect.name` 分支并注释说明。目前仅一处：SQLite 的 `PRAGMA foreign_keys=ON`（pysqlite 默认关闭外键，Postgres 默认开启；不开会让 dev/test 静默接受 prod 会拒绝的孤儿行）。这类配置服务于本约束的**目的**——不让 dev 与 prod 行为分叉——而不是违反它。
 - **不使用 BigQuery。** 规格 §4.1 原定 PyPI 走 BigQuery；实测其 `file_downloads` 表按日分区即达数十 GB，按日查询一个月会耗尽 1TB/月免费额度。改用 `pypistats.org` API（180 天日粒度、免费、限速 ~30 req/min）。**趋势窗口因此为 180 天，不是 12 个月，页面上必须如实标注为 "180d trend"。**
 - **本机无 Docker**（实测 `docker` not found）。所有 quickstart 实跑只在 GitHub Actions `ubuntu-latest` runner 上执行，该 runner 预装 Docker。**任何任务都不得要求本地起容器。**
 - 所有时间戳一律 **UTC**，数据库中存 naive UTC datetime。
@@ -69,7 +70,7 @@
 
 **Interfaces:**
 - Consumes: 无
-- Produces: `aisel.db.get_engine(url: str | None = None) -> Engine`、`aisel.db.get_session() -> Session`、`aisel.db.init_db(engine: Engine) -> None`；ORM 类 `UseCase` `Repo` `MetricDaily` `QuickstartRun` `Verdict`（字段见下方代码）
+- Produces: `aisel.db.get_engine(url: str | None = None) -> Engine`、`aisel.db.session_scope(engine: Engine)`（contextmanager，yield `Session`，退出时 commit／异常时 rollback）、`aisel.db.init_db(engine: Engine) -> None`；ORM 类 `UseCase` `Repo` `MetricDaily` `QuickstartRun` `Verdict`（字段见下方代码）
 
 - [ ] **Step 1: 写 `pyproject.toml`**
 
@@ -159,6 +160,8 @@ AISEL_DB_URL=sqlite:///aisel.db
 ```python
 import datetime as dt
 
+import pytest
+
 from aisel.db import get_engine, init_db, session_scope
 from aisel.models import MetricDaily, Repo, UseCase
 
@@ -204,6 +207,24 @@ def test_metric_unique_key_allows_upsert_semantics(tmp_path):
         pass
     else:
         raise AssertionError("expected IntegrityError on duplicate (repo_id, date, metric)")
+
+
+def test_orphan_foreign_key_is_rejected(tmp_path):
+    """SQLite leaves FK enforcement off by default; Postgres does not.
+
+    Without the connect-time PRAGMA, a stale repo_id inserts silently in dev
+    and fails only in production. Every later task writes rows keyed on
+    repo_id, so this guard protects the whole pipeline.
+    """
+    from sqlalchemy.exc import IntegrityError
+
+    engine = get_engine(f"sqlite:///{tmp_path/'t.db'}")
+    init_db(engine)
+
+    with pytest.raises(IntegrityError):
+        with session_scope(engine) as s:
+            s.add(MetricDaily(repo_id=999, date=dt.date(2026, 8, 9),
+                              metric="stars_total", value=1.0))
 ```
 
 - [ ] **Step 4: 跑测试确认失败**
@@ -220,7 +241,7 @@ from __future__ import annotations
 import os
 from contextlib import contextmanager
 
-from sqlalchemy import Engine, create_engine
+from sqlalchemy import Engine, create_engine, event
 from sqlalchemy.orm import Session, sessionmaker
 
 from aisel.models import Base
@@ -228,8 +249,27 @@ from aisel.models import Base
 DEFAULT_URL = "sqlite:///aisel.db"
 
 
+def _enforce_sqlite_foreign_keys(engine: Engine) -> None:
+    """pysqlite leaves foreign keys OFF; Postgres has them ON.
+
+    Without this, dev and test silently accept orphan rows that production
+    would reject — the exact dev/prod divergence the SQLite-now/Postgres-later
+    decision is supposed to avoid.
+    """
+    if engine.dialect.name != "sqlite":
+        return
+
+    @event.listens_for(engine, "connect")
+    def _set_pragma(dbapi_connection, _connection_record):  # noqa: ANN001
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.close()
+
+
 def get_engine(url: str | None = None) -> Engine:
-    return create_engine(url or os.environ.get("AISEL_DB_URL", DEFAULT_URL))
+    engine = create_engine(url or os.environ.get("AISEL_DB_URL", DEFAULT_URL))
+    _enforce_sqlite_foreign_keys(engine)
+    return engine
 
 
 def init_db(engine: Engine) -> None:
@@ -345,7 +385,7 @@ class Verdict(Base):
 - [ ] **Step 7: 跑测试确认通过**
 
 Run: `python -m pytest tests/test_models.py -v`
-Expected: 2 passed
+Expected: 3 passed
 
 - [ ] **Step 8: 提交**
 
