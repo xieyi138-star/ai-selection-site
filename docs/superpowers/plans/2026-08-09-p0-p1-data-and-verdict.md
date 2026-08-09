@@ -3801,7 +3801,7 @@ git commit -m "feat: ranked verdicts with confidence and evidence snapshot"
 2. **结论区**：primary / conditional / avoid / insufficient_data 分组呈现
 3. 四轴表格，每行带 confidence 列
 4. quickstart 实跑结果与失败原因
-5. **数据窗口声明**：`Download figures are 30-day totals; trend window is 180 days (pypistats retention).`
+5. **数据窗口与口径声明**：下载量是 30 天安装次数、**含 CI 与容器构建**（不是人数）、已排除镜像流量；趋势窗口 180 天（pypistats 保留期）；quickstart 结果来自干净容器实跑。见 `WINDOW_NOTE` 常量。
 6. 生成时间戳
 
 - [ ] **Step 1: 写失败的测试 `tests/test_stage_page.py`**
@@ -3858,7 +3858,9 @@ def test_page_contains_all_required_sections(tmp_path):
     assert "run-llama/llama_index" in md
     assert "stale/oldrag" in md
     assert "Confidence" in md
-    assert "trend window is 180 days" in md
+    assert "Trend window is 180 days" in md
+    # The page must not let a reader mistake install counts for people.
+    assert "not a count of people" in md
     assert "2026-08-09" in md
 
 
