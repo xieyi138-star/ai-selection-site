@@ -3457,7 +3457,9 @@ from aisel.models import MetricDaily, QuickstartRun, Repo, UseCase, Verdict
 from aisel.scoring import axes
 from aisel.scoring.verdict import generate
 
-TH = {"adoption":               {"strong": 100000.0, "moderate": 10000.0},
+TH = {"adoption_pypi":          {"strong": 100000.0, "moderate": 10000.0},
+      "adoption_npm":           {"strong": 500000.0, "moderate": 50000.0},
+      "adoption_docker":        {"strong": 1000000.0, "moderate": 100000.0},
       "alive_release":          {"strong": 30.0, "moderate": 120.0},
       "alive_commits":          {"strong": 50.0, "moderate": 10.0},
       "alive_bus":              {"strong": 5.0, "moderate": 2.0},
