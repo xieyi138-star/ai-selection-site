@@ -29,7 +29,12 @@ def _pypi(client: httpx.Client, pkg: str, today: dt.date) -> dict[str, float]:
     payload = request_json(client, "GET", PYPISTATS.format(pkg=pkg))
     series: dict[dt.date, float] = {}
     for row in payload["data"]:
-        if row.get("category") not in (None, "with_mirrors"):
+        # Every date appears twice, once per category. Take without_mirrors:
+        # mirror traffic is bulk-sync bots, not somebody installing the package,
+        # and this axis exists to measure real adoption rather than volume.
+        # It is also the number pypistats.org itself displays — a reader who
+        # checks our figure against the public page must find them equal.
+        if row.get("category") not in (None, "without_mirrors"):
             continue
         series[dt.date.fromisoformat(row["date"])] = float(row["downloads"])
     recent, prev = _split_windows(series, today)
