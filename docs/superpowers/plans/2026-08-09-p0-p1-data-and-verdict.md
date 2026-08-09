@@ -1109,7 +1109,9 @@ git commit -m "feat: http retry base, idempotent metric writes, github activity 
 
 **Interfaces:**
 - Consumes: `aisel.collectors.base.request_json`（Task 3）
-- Produces: `aisel.collectors.github_issues.collect(client, owner, name, today=None) -> dict[str, float]`，键：`issue_first_response_p50_hours`（无样本时为 `-1.0`）、`issues_opened_90d`、`issues_closed_90d`
+- Produces: `aisel.collectors.github_issues.collect(client, owner, name, today=None) -> dict[str, float]`，键：`issue_first_response_p50_hours`（无样本时为 `-1.0`）、`issues_opened_90d`、`issues_closed_90d`、`issues_no_response_90d`
+
+> **为什么要单独采 `issues_no_response_90d`**：2026-08-09 实测 langgraph 90 天内 180 个 issue，**36 个（20%）无人回复**。首响中位数只统计「有回复的那些」——一个 80% 提问被无视、但回的那 20% 一小时内回的仓库，会被判成响应"strong"。这条目前**只采不评分**（spec §4.2 未列它），但必须从第一天就采：`metrics_daily` 是增量累积的，今天不采就永远补不回来，而采集器在 7 天时钟启动后改动会让时钟重来。
 
 > 用 GraphQL 而非 REST：REST 需为每个 issue 再取一次 comments（N+1，40 repo × 50 issue ≈ 2000 请求/天）。GraphQL 一个请求即可带回 issue 与其首条评论，40 请求/天。
 
@@ -1152,6 +1154,8 @@ def test_median_first_response_ignores_self_replies_and_uncommented_issues():
 
     assert out["issue_first_response_p50_hours"] == 6.0
     assert out["issues_opened_90d"] == 5.0
+    # 2 of the 5 got no external response: the self-reply and the uncommented one.
+    assert out["issues_no_response_90d"] == 2.0
 
 
 @respx.mock
@@ -1247,6 +1251,7 @@ def collect(client: httpx.Client, owner: str, name: str,
     latencies: list[float] = []
     opened = 0
     closed = 0
+    no_response = 0
     cursor: str | None = None
 
     for _ in range(MAX_PAGES):
@@ -1267,6 +1272,8 @@ def collect(client: httpx.Client, owner: str, name: str,
             hours = _first_external_response_hours(issue)
             if hours is not None:
                 latencies.append(hours)
+            else:
+                no_response += 1
         page = issues["pageInfo"]
         if stop or not page["hasNextPage"]:
             break
@@ -1277,6 +1284,7 @@ def collect(client: httpx.Client, owner: str, name: str,
             float(statistics.median(latencies)) if latencies else NO_SAMPLE),
         "issues_opened_90d": float(opened),
         "issues_closed_90d": float(closed),
+        "issues_no_response_90d": float(no_response),
     }
 ```
 
@@ -2625,11 +2633,12 @@ import pytest
 from aisel.scoring.axes import rate_all, rate_axis
 
 TH = {
-    "adoption":      {"strong": 100000.0, "moderate": 10000.0},
-    "alive_release": {"strong": 30.0, "moderate": 120.0},   # days, lower better
-    "alive_commits": {"strong": 50.0, "moderate": 10.0},    # commits/90d, higher better
-    "alive_bus":     {"strong": 5.0, "moderate": 2.0},      # contributors/90d, higher better
-    "responsive":    {"strong": 24.0, "moderate": 168.0},   # hours, lower better
+    "adoption":               {"strong": 100000.0, "moderate": 10000.0},
+    "alive_release":          {"strong": 30.0, "moderate": 120.0},  # days, lower better
+    "alive_commits":          {"strong": 50.0, "moderate": 10.0},   # commits/90d, higher
+    "alive_bus":              {"strong": 5.0, "moderate": 2.0},     # contributors, higher
+    "responsive_latency":     {"strong": 24.0, "moderate": 168.0},  # hours, lower better
+    "responsive_close_ratio": {"strong": 0.6, "moderate": 0.25},    # closed/opened, higher
 }
 
 
@@ -2669,6 +2678,28 @@ def test_alive_unknown_when_no_vital_sign_present():
 
 def test_responsive_unknown_when_sentinel_no_sample():
     m = {"issue_first_response_p50_hours": -1.0}
+    assert rate_all(m, run_status=None, thresholds=TH)["responsive"] == "unknown"
+
+
+def test_fast_replies_cannot_hide_a_repo_that_never_closes_anything():
+    """The failure this axis exists to catch: answers within the hour, but
+    almost nothing ever gets resolved."""
+    m = {"issue_first_response_p50_hours": 1.0,   # strong
+         "issues_opened_90d": 200.0,
+         "issues_closed_90d": 10.0}               # ratio 0.05 -> weak
+    assert rate_all(m, run_status=None, thresholds=TH)["responsive"] == "weak"
+
+
+def test_close_ratio_alone_rates_responsiveness_when_latency_has_no_sample():
+    m = {"issue_first_response_p50_hours": -1.0,
+         "issues_opened_90d": 100.0,
+         "issues_closed_90d": 80.0}               # ratio 0.8 -> strong
+    assert rate_all(m, run_status=None, thresholds=TH)["responsive"] == "strong"
+
+
+def test_zero_opened_issues_contributes_no_close_ratio_band():
+    """Dividing by zero opened issues is not a 0% close rate — it is no data."""
+    m = {"issues_opened_90d": 0.0, "issues_closed_90d": 0.0}
     assert rate_all(m, run_status=None, thresholds=TH)["responsive"] == "unknown"
 
 
@@ -2808,11 +2839,27 @@ def rate_all(metrics: dict[str, float], run_status: str | None,
                                      th["alive_bus"], lower_better=False))
     alive = _worst(alive_parts)
 
+    # Spec §4.2: responsiveness is speed AND whether issues actually get closed.
+    # Median latency alone rates a repo "strong" when it answers 20% of issues
+    # within the hour and ignores the other 80% — measured on langgraph
+    # 2026-08-09: 180 issues opened in 90 days, 36 of them never answered.
+    #
+    # Deliberate deviation: the spec's third signal, absolute unresolved-issue
+    # growth, is not used. It is scale-dependent — 1000 opened/900 closed and
+    # 10 opened/9 closed are equally healthy but score +100 vs +1 — so it would
+    # systematically penalise high-traffic projects. The close ratio carries the
+    # same information scale-invariantly.
+    responsive_parts: list[str] = []
     latency = metrics.get("issue_first_response_p50_hours", NO_SAMPLE)
-    if latency == NO_SAMPLE:
-        responsive = UNKNOWN
-    else:
-        responsive = rate_axis(latency, th["responsive"], lower_better=True)
+    if latency != NO_SAMPLE:
+        responsive_parts.append(rate_axis(latency, th["responsive_latency"],
+                                          lower_better=True))
+    opened = metrics.get("issues_opened_90d", 0.0)
+    if opened > 0:
+        ratio = metrics.get("issues_closed_90d", 0.0) / opened
+        responsive_parts.append(rate_axis(ratio, th["responsive_close_ratio"],
+                                          lower_better=False))
+    responsive = _worst(responsive_parts)
 
     return {
         "adoption": adoption,
@@ -2827,7 +2874,7 @@ def rate_all(metrics: dict[str, float], run_status: str | None,
 - [ ] **Step 4: 跑测试确认通过**
 
 Run: `python -m pytest tests/test_axes.py -v`
-Expected: 14 passed
+Expected: 17 passed
 
 - [ ] **Step 5: 写 `scripts/calibrate.py` 并用真实数据定阈值**
 
@@ -2850,13 +2897,38 @@ from aisel.scoring.axes import DOWNLOAD_METRICS, NO_SAMPLE, latest_metrics
 SENTINELS = {NO_SAMPLE, NEVER_RELEASED}
 
 AXES = {
-    "adoption      (max downloads_30d, higher better)": DOWNLOAD_METRICS,
-    "alive_release (days_since_last_release, lower better)": ("days_since_last_release",),
-    "alive_commits (commits_90d, higher better)": ("commits_90d",),
-    "alive_bus     (contributors_90d, higher better)": ("contributors_90d",),
-    "responsive    (issue_first_response_p50_hours, lower better)":
+    "adoption           (max downloads_30d, higher better)": DOWNLOAD_METRICS,
+    "alive_release      (days_since_last_release, lower better)":
+        ("days_since_last_release",),
+    "alive_commits      (commits_90d, higher better)": ("commits_90d",),
+    "alive_bus          (contributors_90d, higher better)": ("contributors_90d",),
+    "responsive_latency (issue_first_response_p50_hours, lower better)":
         ("issue_first_response_p50_hours",),
 }
+
+
+def _close_ratio(m: dict[str, float]) -> float | None:
+    """Zero opened issues is no data, not a 0% close rate."""
+    opened = m.get("issues_opened_90d", 0.0)
+    if opened <= 0:
+        return None
+    return m.get("issues_closed_90d", 0.0) / opened
+
+
+DERIVED = {
+    "responsive_close_ratio (closed/opened over 90d, higher better)": _close_ratio,
+}
+
+
+def _summarise(label: str, values: list[float], excluded: int) -> None:
+    if not values:
+        print(f"{label}: no data  (sentinel-only: {excluded})")
+        return
+    values.sort()
+    q = statistics.quantiles(values, n=4)
+    print(f"{label}\n  n={len(values)}  sentinel-excluded={excluded}  "
+          f"min={values[0]:.3g}  p25={q[0]:.3g}  p50={q[1]:.3g}  "
+          f"p75={q[2]:.3g}  max={values[-1]:.3g}")
 
 
 def main() -> int:
@@ -2880,14 +2952,11 @@ def main() -> int:
                 excluded += 1
             if usable:
                 values.append(max(usable) if len(keys) > 1 else usable[0])
-        if not values:
-            print(f"{label}: no data  (sentinel-only: {excluded})")
-            continue
-        values.sort()
-        q = statistics.quantiles(values, n=4)
-        print(f"{label}\n  n={len(values)}  sentinel-excluded={excluded}  "
-              f"min={values[0]:.1f}  p25={q[0]:.1f}  p50={q[1]:.1f}  "
-              f"p75={q[2]:.1f}  max={values[-1]:.1f}")
+        _summarise(label, values, excluded)
+
+    for label, fn in DERIVED.items():
+        computed = [v for v in (fn(m) for m in snapshots.values()) if v is not None]
+        _summarise(label, computed, len(snapshots) - len(computed))
     return 0
 
 
@@ -2897,9 +2966,9 @@ if __name__ == "__main__":
 
 Run: `AISEL_DB_URL=sqlite:///data/aisel.db python scripts/calibrate.py`
 
-**定阈值规则（五个轴一律照此，不允许逐轴拍脑袋）：**
-- 「越大越好」的轴（`adoption`、`alive_commits`、`alive_bus`）：`strong = p75`，`moderate = p25`
-- 「越小越好」的轴（`alive_release`、`responsive`）：`strong = p25`，`moderate = p75`
+**定阈值规则（六个轴一律照此，不允许逐轴拍脑袋）：**
+- 「越大越好」（`adoption`、`alive_commits`、`alive_bus`、`responsive_close_ratio`）：`strong = p75`，`moderate = p25`
+- 「越小越好」（`alive_release`、`responsive_latency`）：`strong = p25`，`moderate = p75`
 
 ⚠️ `sentinel-excluded` 计数不为 0 时要看一眼：它表示有多少 repo 在这一轴上**根本没有测量值**（从未发过 release、90 天内无人回复 issue）。这些 repo 在该轴上会被判为 `unknown`，不是被判为差——这正是置信度分级要处理的情况，不要试图给它们编一个数。
 
