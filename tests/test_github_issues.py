@@ -34,6 +34,8 @@ def test_median_first_response_ignores_self_replies_and_uncommented_issues():
 
     assert out["issue_first_response_p50_hours"] == 6.0
     assert out["issues_opened_90d"] == 5.0
+    # 2 of the 5 got no external response: the self-reply and the uncommented one.
+    assert out["issues_no_response_90d"] == 2.0
 
 
 @respx.mock

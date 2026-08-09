@@ -54,6 +54,7 @@ def collect(client: httpx.Client, owner: str, name: str,
     latencies: list[float] = []
     opened = 0
     closed = 0
+    no_response = 0
     cursor: str | None = None
 
     for _ in range(MAX_PAGES):
@@ -74,6 +75,8 @@ def collect(client: httpx.Client, owner: str, name: str,
             hours = _first_external_response_hours(issue)
             if hours is not None:
                 latencies.append(hours)
+            else:
+                no_response += 1
         page = issues["pageInfo"]
         if stop or not page["hasNextPage"]:
             break
@@ -84,4 +87,5 @@ def collect(client: httpx.Client, owner: str, name: str,
             float(statistics.median(latencies)) if latencies else NO_SAMPLE),
         "issues_opened_90d": float(opened),
         "issues_closed_90d": float(closed),
+        "issues_no_response_90d": float(no_response),
     }
