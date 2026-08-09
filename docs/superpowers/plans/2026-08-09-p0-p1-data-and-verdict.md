@@ -1586,7 +1586,8 @@ git commit -m "feat: issue responsiveness collector via graphql"
 
 **Interfaces:**
 - Consumes: `aisel.collectors.base.request_json`（Task 3）
-- Produces: `aisel.collectors.downloads.collect(client, spec: RepoSpec) -> dict[str, float]`，键（仅在对应包名存在时出现）：`downloads_pypi_30d`、`downloads_pypi_prev30d`、`downloads_npm_30d`、`downloads_npm_prev30d`、`dockerhub_pulls_total`
+- Produces: `aisel.collectors.downloads.collect(client, spec: RepoSpec) -> dict[str, float]`，键（仅在对应包名存在时出现）：`downloads_pypi_30d`、`downloads_pypi_prev30d`、`downloads_pypi_days_30d`、`downloads_pypi_days_prev30d`、`downloads_npm_30d`、`downloads_npm_prev30d`、`downloads_npm_days_30d`、`downloads_npm_days_prev30d`、`dockerhub_pulls_total`
+- 同时导出 `aisel.collectors.downloads._require(payload, key, what)` 供三个私有取数函数复用（缺键时抛带主体名的 `RuntimeError`）
 
 > `prev30d` 是趋势的基础：`当前 30 天 / 前一个 30 天`。pypistats 只保留 180 天，因此规格中的「12 个月趋势」在 MVP 降级为「180 天窗口内的 30d vs prev30d」，页面必须标注为 180d。
 
@@ -1632,6 +1633,8 @@ def test_pypi_splits_recent_and_previous_windows():
 
     assert out["downloads_pypi_30d"] == 6000.0
     assert out["downloads_pypi_prev30d"] == 3000.0
+    assert out["downloads_pypi_days_30d"] == 30.0
+    assert out["downloads_pypi_days_prev30d"] == 30.0  # both windows complete
 
 
 @respx.mock
@@ -1654,9 +1657,12 @@ def test_npm_and_dockerhub_are_collected_when_configured():
 
     assert out["downloads_npm_30d"] == 300.0
     assert out["downloads_npm_prev30d"] == 300.0
+    assert out["downloads_npm_days_30d"] == 30.0
+    assert out["downloads_npm_days_prev30d"] == 30.0
     assert out["dockerhub_pulls_total"] == 4200000.0
 
 
+@respx.mock  # no routes registered: any real network call fails hermetically
 def test_repo_with_no_packages_yields_empty_dict():
     """"No package declared" is a measurement, not a failure — the scoring layer
     maps the empty result to unknown confidence. This is the one case where
@@ -1666,13 +1672,35 @@ def test_repo_with_no_packages_yields_empty_dict():
 
 
 @respx.mock
+def test_short_history_shows_up_in_the_day_counts_not_hidden_in_the_sums():
+    """A package younger than 60 days has a FULL recent window and a PARTIAL
+    previous one, so perfectly flat traffic reads as 3x growth. The sums alone
+    cannot separate "quiet last month" from "did not exist last month"; the day
+    counts can, and metrics_daily cannot be backfilled."""
+    days = [{"date": (dt.date(2026, 8, 9) - dt.timedelta(days=k)).isoformat(),
+             "downloads": 100, "category": "without_mirrors"}
+            for k in range(40)]  # only 40 days of history
+    respx.get("https://pypistats.org/api/packages/newpkg/overall").mock(
+        return_value=httpx.Response(200, json={"data": days}))
+
+    with httpx.Client() as c:
+        out = collect(c, _spec(pypi_package="newpkg"), today=dt.date(2026, 8, 10))
+
+    assert out["downloads_pypi_days_30d"] == 30.0       # complete
+    assert out["downloads_pypi_days_prev30d"] == 10.0   # partial -> trend invalid
+    # A naive 3000/1000 would announce 3x growth from perfectly flat traffic.
+    assert out["downloads_pypi_30d"] == 3000.0
+    assert out["downloads_pypi_prev30d"] == 1000.0
+
+
+@respx.mock
 def test_malformed_pypistats_payload_raises_instead_of_reporting_zero():
     """A shape change upstream must not read as "this package has no downloads".
     Zero is a plausible, publishable, wrong number — CONSTITUTION.md rule 2."""
     respx.get("https://pypistats.org/api/packages/langgraph/overall").mock(
         return_value=httpx.Response(200, json={"unexpected": "shape"}))
     with httpx.Client() as c:
-        with pytest.raises(KeyError):
+        with pytest.raises(RuntimeError, match="pypistats payload for 'langgraph'"):
             collect(c, _spec(pypi_package="langgraph"), today=dt.date(2026, 8, 10))
 
 
@@ -1681,7 +1709,7 @@ def test_malformed_npm_payload_raises_instead_of_reporting_zero():
     respx.get(url__regex=r"https://api\.npmjs\.org/downloads/range/.*").mock(
         return_value=httpx.Response(200, json={"error": "package not found"}))
     with httpx.Client() as c:
-        with pytest.raises(KeyError):
+        with pytest.raises(RuntimeError, match="npm payload for 'nope'"):
             collect(c, _spec(npm_package="nope"), today=dt.date(2026, 8, 10))
 ```
 
@@ -1711,19 +1739,46 @@ DOCKERHUB = "https://hub.docker.com/v2/repositories/{repo}/"
 WINDOW = 30
 
 
-def _split_windows(series: dict[dt.date, float], today: dt.date) -> tuple[float, float]:
-    """Return (sum over last 30d, sum over the 30d before that)."""
+def _require(payload, key: str, what: str):
+    """Fetch a required key, naming the subject when it is missing.
+
+    A bare KeyError several frames from its cause costs hours at 3am; the
+    sibling collectors all name the repo they were working on.
+    """
+    try:
+        return payload[key]
+    except (KeyError, TypeError) as exc:
+        raise RuntimeError(f"{what}: missing key {key!r}") from exc
+
+
+def _split_windows(series: dict[dt.date, float],
+                   today: dt.date) -> tuple[float, float, int, int]:
+    """Return (recent 30d sum, previous 30d sum, recent days, previous days).
+
+    The day counts are not decoration. A package younger than 60 days has a
+    FULL recent window and a PARTIAL previous one, so perfectly flat traffic
+    reads as explosive growth — a plausible, flattering, wrong number. From the
+    sums alone nothing downstream can tell "quiet last month" from "did not
+    exist last month". `metrics_daily` stores one bare float per metric and
+    cannot be backfilled, so the coverage is recorded here or never.
+
+    Deliberately does NOT raise on a short window, unlike github_issues' hard
+    truncation check: a short history is the normal state of a genuinely new
+    package, and refusing to collect it would be worse than collecting it with
+    its coverage stated.
+    """
     recent_start = today - dt.timedelta(days=WINDOW)
     prev_start = today - dt.timedelta(days=WINDOW * 2)
-    recent = sum(v for d, v in series.items() if recent_start <= d < today)
-    prev = sum(v for d, v in series.items() if prev_start <= d < recent_start)
-    return float(recent), float(prev)
+    recent = {d: v for d, v in series.items() if recent_start <= d < today}
+    prev = {d: v for d, v in series.items() if prev_start <= d < recent_start}
+    return (float(sum(recent.values())), float(sum(prev.values())),
+            len(recent), len(prev))
 
 
 def _pypi(client: httpx.Client, pkg: str, today: dt.date) -> dict[str, float]:
     payload = request_json(client, "GET", PYPISTATS.format(pkg=pkg))
     series: dict[dt.date, float] = {}
-    for row in payload["data"]:
+    for row in _require(payload, "data", f"pypistats payload for {pkg!r}"):
         # Every date appears twice, once per category. Take without_mirrors:
         # mirror traffic is bulk-sync bots, not somebody installing the package,
         # and this axis exists to measure real adoption rather than volume.
@@ -1732,23 +1787,34 @@ def _pypi(client: httpx.Client, pkg: str, today: dt.date) -> dict[str, float]:
         if row.get("category") not in (None, "without_mirrors"):
             continue
         series[dt.date.fromisoformat(row["date"])] = float(row["downloads"])
-    recent, prev = _split_windows(series, today)
-    return {"downloads_pypi_30d": recent, "downloads_pypi_prev30d": prev}
+    recent, prev, recent_days, prev_days = _split_windows(series, today)
+    return {
+        "downloads_pypi_30d": recent,
+        "downloads_pypi_prev30d": prev,
+        "downloads_pypi_days_30d": float(recent_days),
+        "downloads_pypi_days_prev30d": float(prev_days),
+    }
 
 
 def _npm(client: httpx.Client, pkg: str, today: dt.date) -> dict[str, float]:
     start = today - dt.timedelta(days=WINDOW * 2)
     payload = request_json(client, "GET", NPM_RANGE.format(
         start=start.isoformat(), end=today.isoformat(), pkg=pkg))
-    series = {dt.date.fromisoformat(r["day"]): float(r["downloads"])
-              for r in payload["downloads"]}
-    recent, prev = _split_windows(series, today)
-    return {"downloads_npm_30d": recent, "downloads_npm_prev30d": prev}
+    rows = _require(payload, "downloads", f"npm payload for {pkg!r}")
+    series = {dt.date.fromisoformat(r["day"]): float(r["downloads"]) for r in rows}
+    recent, prev, recent_days, prev_days = _split_windows(series, today)
+    return {
+        "downloads_npm_30d": recent,
+        "downloads_npm_prev30d": prev,
+        "downloads_npm_days_30d": float(recent_days),
+        "downloads_npm_days_prev30d": float(prev_days),
+    }
 
 
 def _dockerhub(client: httpx.Client, repo: str) -> dict[str, float]:
     payload = request_json(client, "GET", DOCKERHUB.format(repo=repo))
-    return {"dockerhub_pulls_total": float(payload["pull_count"])}
+    return {"dockerhub_pulls_total": float(
+        _require(payload, "pull_count", f"docker hub payload for {repo!r}"))}
 
 
 def collect(client: httpx.Client, spec: RepoSpec,
