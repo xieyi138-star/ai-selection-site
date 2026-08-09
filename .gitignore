@@ -3,6 +3,7 @@ __pycache__/
 *.pyc
 .pytest_cache/
 *.db
+!data/aisel.db
 .venv/
 build/
 dist/
