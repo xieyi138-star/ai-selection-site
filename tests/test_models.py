@@ -1,5 +1,7 @@
 import datetime as dt
 
+import pytest
+
 from aisel.db import get_engine, init_db, session_scope
 from aisel.models import MetricDaily, Repo, UseCase
 
@@ -45,3 +47,21 @@ def test_metric_unique_key_allows_upsert_semantics(tmp_path):
         pass
     else:
         raise AssertionError("expected IntegrityError on duplicate (repo_id, date, metric)")
+
+
+def test_orphan_foreign_key_is_rejected(tmp_path):
+    """SQLite leaves FK enforcement off by default; Postgres does not.
+
+    Without the connect-time PRAGMA, a stale repo_id inserts silently in dev
+    and fails only in production. Every later task writes rows keyed on
+    repo_id, so this guard protects the whole pipeline.
+    """
+    from sqlalchemy.exc import IntegrityError
+
+    engine = get_engine(f"sqlite:///{tmp_path/'t.db'}")
+    init_db(engine)
+
+    with pytest.raises(IntegrityError):
+        with session_scope(engine) as s:
+            s.add(MetricDaily(repo_id=999, date=dt.date(2026, 8, 9),
+                              metric="stars_total", value=1.0))
