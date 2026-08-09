@@ -3105,9 +3105,12 @@ from aisel.models import MetricDaily, QuickstartRun, Repo, UseCase, Verdict
 from aisel.scoring import axes
 from aisel.scoring.verdict import generate
 
-TH = {"adoption": {"strong": 100000.0, "moderate": 10000.0},
-      "alive": {"strong": 30.0, "moderate": 120.0},
-      "responsive": {"strong": 24.0, "moderate": 168.0}}
+TH = {"adoption":               {"strong": 100000.0, "moderate": 10000.0},
+      "alive_release":          {"strong": 30.0, "moderate": 120.0},
+      "alive_commits":          {"strong": 50.0, "moderate": 10.0},
+      "alive_bus":              {"strong": 5.0, "moderate": 2.0},
+      "responsive_latency":     {"strong": 24.0, "moderate": 168.0},
+      "responsive_close_ratio": {"strong": 0.6, "moderate": 0.25}}
 
 D = dt.date(2026, 8, 9)
 NOW = dt.datetime(2026, 8, 9, 12, 0)
