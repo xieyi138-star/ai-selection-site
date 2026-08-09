@@ -1923,6 +1923,33 @@ def test_one_repo_failing_does_not_abort_the_run(tmp_path, monkeypatch):
     assert metrics == {"stars_total", "issues_opened_90d"}
 
 
+def test_the_github_token_is_never_sent_to_third_party_hosts(tmp_path, monkeypatch):
+    """httpx sends a client's default headers to EVERY host. One shared client
+    would post the GitHub bearer token to pypistats.org, api.npmjs.org and
+    hub.docker.com on every daily run. None of them needs authentication."""
+    engine = get_engine(f"sqlite:///{tmp_path/'t.db'}")
+    init_db(engine)
+    cfg = _write_cfg(tmp_path)
+    seen: dict[str, object] = {}
+
+    def capture(client, spec, today=None):
+        seen["download_auth"] = client.headers.get("Authorization")
+        return {}
+
+    def check_gh(client, owner, name, today=None):
+        seen["github_auth"] = client.headers.get("Authorization")
+        return {"stars_total": 1.0}
+
+    monkeypatch.setattr(pipeline.github_activity, "collect", check_gh)
+    monkeypatch.setattr(pipeline.github_issues, "collect", lambda *a, **k: {})
+    monkeypatch.setattr(pipeline.downloads, "collect", capture)
+
+    pipeline.run(engine, cfg, today=dt.date(2026, 8, 9), token="sekrit")
+
+    assert seen["github_auth"] == "Bearer sekrit"   # GitHub still authenticated
+    assert seen["download_auth"] is None            # third parties get nothing
+
+
 def test_rerunning_the_same_day_does_not_duplicate_rows(tmp_path, monkeypatch):
     engine = get_engine(f"sqlite:///{tmp_path/'t.db'}")
     init_db(engine)
@@ -1987,19 +2014,24 @@ def run(engine: Engine, config_path: str | Path,
         ids = {(r.owner, r.name): r.id for r in s.query(Repo).all()}
 
     report = PipelineReport(total=len(specs))
-    headers = {"Authorization": f"Bearer {token}",
-               "Accept": "application/vnd.github+json"}
+    gh_headers = {"Authorization": f"Bearer {token}",
+                  "Accept": "application/vnd.github+json"}
 
-    with httpx.Client(headers=headers, timeout=60) as client:
+    # TWO clients, deliberately. httpx sends a client's default headers to every
+    # host it talks to, so a single shared client would post the GitHub bearer
+    # token to pypistats.org, api.npmjs.org and hub.docker.com on every daily
+    # run. None of those needs authentication at all.
+    with httpx.Client(headers=gh_headers, timeout=60) as gh_client, \
+            httpx.Client(timeout=60) as public_client:
         for spec in specs:
             slug = f"{spec.owner}/{spec.name}"
             try:
                 values: dict[str, float] = {}
-                values.update(github_activity.collect(client, spec.owner, spec.name,
+                values.update(github_activity.collect(gh_client, spec.owner, spec.name,
                                                       today=today))
-                values.update(github_issues.collect(client, spec.owner, spec.name,
+                values.update(github_issues.collect(gh_client, spec.owner, spec.name,
                                                     today=today))
-                values.update(downloads.collect(client, spec, today=today))
+                values.update(downloads.collect(public_client, spec, today=today))
                 write_metrics(engine, ids[(spec.owner, spec.name)], today, values)
                 report.ok += 1
             except Exception as exc:  # noqa: BLE001 - report, never abort
@@ -2099,7 +2131,13 @@ jobs:
           mkdir -p data
           python -m aisel.pipeline --config config/repos.yaml
 
+      # `if: always()` is load-bearing, not boilerplate. The collect step exits
+      # non-zero when ANY single repo fails, so without this one transient
+      # failure would discard all 40 repos' data for the day — and the P0 gate
+      # requires 7 consecutive days with no gaps, so that one blip would reset
+      # the clock by a week. Keep the data, let the run go red.
       - name: Commit snapshot
+        if: always()
         run: |
           git config user.name  "aisel-bot"
           git config user.email "aisel-bot@users.noreply.github.com"
