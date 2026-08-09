@@ -1,4 +1,5 @@
 import datetime as dt
+import time
 
 import httpx
 import pytest
@@ -38,6 +39,33 @@ def test_request_json_raises_after_exhausting_retries():
     respx.get("https://api.example/y").mock(return_value=httpx.Response(503))
     with httpx.Client() as c, pytest.raises(httpx.HTTPStatusError):
         request_json(c, "GET", "https://api.example/y", max_attempts=2)
+
+
+@respx.mock
+def test_secondary_rate_limit_403_is_retried_and_obeys_retry_after(monkeypatch):
+    """GitHub answers a tripped secondary limit with 403 + Retry-After: 60.
+    Measured on vllm 2026-08-09. Exponential backoff tops out near 4s here, so
+    guessing the wait instead of reading the header simply fails."""
+    slept: list[float] = []
+    monkeypatch.setattr(time, "sleep", slept.append)
+    route = respx.get("https://api.example/rl").mock(side_effect=[
+        httpx.Response(403, headers={"Retry-After": "60"}, json={}),
+        httpx.Response(200, json={"ok": True}),
+    ])
+    with httpx.Client() as c:
+        assert request_json(c, "GET", "https://api.example/rl") == {"ok": True}
+    assert route.call_count == 2
+    assert slept == [60.0]  # obeyed the header, did not use backoff
+
+
+@respx.mock
+def test_bare_403_fails_immediately_instead_of_being_retried():
+    """A dead token must surface as an error, not be disguised as slowness."""
+    route = respx.get("https://api.example/forbidden").mock(
+        return_value=httpx.Response(403, json={"message": "Bad credentials"}))
+    with httpx.Client() as c, pytest.raises(httpx.HTTPStatusError):
+        request_json(c, "GET", "https://api.example/forbidden")
+    assert route.call_count == 1  # not retried
 
 
 def _seed(engine):

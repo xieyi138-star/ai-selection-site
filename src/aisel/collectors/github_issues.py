@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import datetime as dt
 import statistics
+import time
 
 import httpx
 
@@ -19,6 +20,10 @@ PAGE_SIZE = 100
 # downward exactly for high-traffic repos. Pages are only fetched until the
 # cutoff is reached, so this ceiling costs nothing for the small repos.
 MAX_PAGES = 40
+# Retry recovers from the secondary rate limit; throttling avoids provoking it.
+# Measured 2026-08-09: 17 back-to-back GraphQL pages against vllm tripped it.
+# Only the few high-traffic repos pay this — everyone else exits after one page.
+PAGE_DELAY_S = 1.0
 NO_SAMPLE = -1.0
 
 QUERY = """
@@ -90,6 +95,7 @@ def collect(client: httpx.Client, owner: str, name: str,
             covered = True
             break
         cursor = page["endCursor"]
+        time.sleep(PAGE_DELAY_S)
 
     if not covered:
         # Ran out of pages before reaching the cutoff. Every count below would

@@ -69,7 +69,7 @@ def test_counts_closed_issues_in_window():
 
 
 @respx.mock
-def test_truncated_window_raises_rather_than_reporting_a_partial_count():
+def test_truncated_window_raises_rather_than_reporting_a_partial_count(monkeypatch):
     """Exhausting MAX_PAGES before reaching the cutoff means every count is an
     undercount — and the surviving sample is the NEWEST issues, which are
     systematically less likely to be closed, so the close ratio would be biased
@@ -77,6 +77,8 @@ def test_truncated_window_raises_rather_than_reporting_a_partial_count():
     issues/90d, llama.cpp 1281, ollama 675.
     """
     import aisel.collectors.github_issues as gi
+
+    monkeypatch.setattr(gi, "PAGE_DELAY_S", 0.0)  # 40 pages x 1s would stall the suite
 
     # Every page: full, entirely in-window, and claiming another page follows.
     page = {"data": {"repository": {"issues": {
