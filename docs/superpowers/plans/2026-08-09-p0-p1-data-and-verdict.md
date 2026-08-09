@@ -388,7 +388,7 @@ class Verdict(Base):
 - [ ] **Step 7: 跑测试确认通过**
 
 Run: `python -m pytest tests/test_models.py -v`
-Expected: 4 passed
+Expected: 3 passed
 
 - [ ] **Step 8: 提交**
 
@@ -1511,7 +1511,7 @@ def collect(client: httpx.Client, spec: RepoSpec,
 - [ ] **Step 4: 跑测试确认通过**
 
 Run: `python -m pytest tests/test_downloads.py -v`
-Expected: 4 passed
+Expected: every test in the file passes, zero failures, output pristine (no warnings). Do not chase a predicted count — the plan does not know how pytest will expand parametrised cases.
 
 - [ ] **Step 5: 对真实包核账**
 
@@ -1705,7 +1705,7 @@ if __name__ == "__main__":
 - [ ] **Step 4: 跑测试确认通过**
 
 Run: `python -m pytest tests/test_pipeline.py -v`
-Expected: 2 passed
+Expected: every test in the file passes, zero failures, output pristine (no warnings). Do not chase a predicted count — the plan does not know how pytest will expand parametrised cases.
 
 - [ ] **Step 5: 全量跑一次真实采集**
 
@@ -1926,7 +1926,7 @@ if __name__ == "__main__":
 - [ ] **Step 4: 跑测试确认通过**
 
 Run: `python -m pytest tests/test_gate_p0.py -v`
-Expected: 2 passed
+Expected: every test in the file passes, zero failures, output pristine (no warnings). Do not chase a predicted count — the plan does not know how pytest will expand parametrised cases.
 
 - [ ] **Step 5: 提交，然后等 7 天**
 
@@ -2086,7 +2086,7 @@ def validate_covers_top(quickstarts: dict[str, Quickstart],
 - [ ] **Step 4: 跑测试确认通过**
 
 Run: `python -m pytest tests/test_manifest.py -v`
-Expected: 4 passed
+Expected: every test in the file passes, zero failures, output pristine (no warnings). Do not chase a predicted count — the plan does not know how pytest will expand parametrised cases.
 
 - [ ] **Step 5: 逐个 repo 填写 `config/quickstarts.yaml`**
 
@@ -2216,7 +2216,7 @@ def classify(exit_code: int, log: str, timed_out: bool,
 - [ ] **Step 4: 跑测试确认通过**
 
 Run: `python -m pytest tests/test_classify.py -v`
-Expected: 10 passed
+Expected: every test in the file passes, zero failures, output pristine (no warnings). Do not chase a predicted count — the plan does not know how pytest will expand parametrised cases.
 
 - [ ] **Step 5: 写失败的测试 `tests/test_runner.py`**
 
@@ -2377,7 +2377,7 @@ def run_all(engine: Engine, quickstarts: dict[str, Quickstart],
 - [ ] **Step 8: 跑测试确认通过**
 
 Run: `python -m pytest tests/test_runner.py -v`
-Expected: 4 passed
+Expected: every test in the file passes, zero failures, output pristine (no warnings). Do not chase a predicted count — the plan does not know how pytest will expand parametrised cases.
 
 - [ ] **Step 9: 提交**
 
@@ -2585,7 +2585,7 @@ if __name__ == "__main__":
 - [ ] **Step 5: 跑测试确认通过**
 
 Run: `python -m pytest tests/test_gate_p1a.py -v`
-Expected: 4 passed
+Expected: every test in the file passes, zero failures, output pristine (no warnings). Do not chase a predicted count — the plan does not know how pytest will expand parametrised cases.
 
 - [ ] **Step 6: 写 `.github/workflows/quickstart.yml`**
 
@@ -2917,7 +2917,7 @@ def rate_all(metrics: dict[str, float], run_status: str | None,
 - [ ] **Step 4: 跑测试确认通过**
 
 Run: `python -m pytest tests/test_axes.py -v`
-Expected: 17 passed
+Expected: every test in the file passes, zero failures, output pristine (no warnings). Do not chase a predicted count — the plan does not know how pytest will expand parametrised cases.
 
 - [ ] **Step 5: 写 `scripts/calibrate.py` 并用真实数据定阈值**
 
@@ -3107,7 +3107,7 @@ def grade(metrics: dict[str, float], ratings: dict[str, str]) -> str:
 - [ ] **Step 4: 跑测试确认通过**
 
 Run: `python -m pytest tests/test_confidence.py -v`
-Expected: 4 passed
+Expected: every test in the file passes, zero failures, output pristine (no warnings). Do not chase a predicted count — the plan does not know how pytest will expand parametrised cases.
 
 - [ ] **Step 5: 提交**
 
@@ -3354,7 +3354,7 @@ def generate(engine: Engine, use_case_id: str,
 - [ ] **Step 4: 跑测试确认通过**
 
 Run: `python -m pytest tests/test_verdict.py -v`
-Expected: 4 passed
+Expected: every test in the file passes, zero failures, output pristine (no warnings). Do not chase a predicted count — the plan does not know how pytest will expand parametrised cases.
 
 - [ ] **Step 5: 提交**
 
@@ -3536,7 +3536,7 @@ def render(engine: Engine, use_case_id: str) -> str:
 - [ ] **Step 4: 跑测试确认通过**
 
 Run: `python -m pytest tests/test_stage_page.py -v`
-Expected: 4 passed
+Expected: every test in the file passes, zero failures, output pristine (no warnings). Do not chase a predicted count — the plan does not know how pytest will expand parametrised cases.
 
 - [ ] **Step 5: 写 `scripts/build_pages.py`**
 
@@ -3778,7 +3778,7 @@ recorded wrong, add a `correction:` field rather than rewriting the original.
 - [ ] **Step 5: 跑测试确认通过**
 
 Run: `python -m pytest tests/test_tally.py -v`
-Expected: 4 passed
+Expected: every test in the file passes, zero failures, output pristine (no warnings). Do not chase a predicted count — the plan does not know how pytest will expand parametrised cases.
 
 - [ ] **Step 6: 提交工具，然后执行盲测**
 
