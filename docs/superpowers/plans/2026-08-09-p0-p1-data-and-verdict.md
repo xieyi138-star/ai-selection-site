@@ -793,6 +793,43 @@ def test_secondary_rate_limit_403_is_retried_and_obeys_retry_after(monkeypatch):
 
 
 @respx.mock
+def test_transport_errors_are_retried_like_a_5xx(monkeypatch):
+    """A dropped connection or DNS blip is the most common transient failure in
+    a daily cron, and it used to get exactly one attempt while a 503 got four.
+    One unretried blip costs a repo its day, which resets the P0 gate's seven."""
+    monkeypatch.setattr(time, "sleep", lambda _s: None)
+    calls = {"n": 0}
+
+    def flaky(request):
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise httpx.ConnectError("simulated connection failure")
+        return httpx.Response(200, json={"ok": True})
+
+    respx.get("https://api.example/flaky").mock(side_effect=flaky)
+    with httpx.Client() as c:
+        assert request_json(c, "GET", "https://api.example/flaky") == {"ok": True}
+    assert calls["n"] == 3  # recovered, not abandoned on the first failure
+
+
+@respx.mock
+def test_a_persistent_transport_error_still_fails_loudly(monkeypatch):
+    """Retrying must not become swallowing: a host that is genuinely gone has
+    to surface, not be reported as a quiet zero."""
+    monkeypatch.setattr(time, "sleep", lambda _s: None)
+    calls = {"n": 0}
+
+    def dead(request):
+        calls["n"] += 1
+        raise httpx.ConnectError("host is gone")
+
+    respx.get("https://api.example/dead").mock(side_effect=dead)
+    with httpx.Client() as c, pytest.raises(httpx.ConnectError):
+        request_json(c, "GET", "https://api.example/dead", max_attempts=3)
+    assert calls["n"] == 3  # spent the whole budget first
+
+
+@respx.mock
 def test_bare_403_fails_immediately_instead_of_being_retried():
     """A dead token must surface as an error, not be disguised as slowness."""
     route = respx.get("https://api.example/forbidden").mock(
@@ -1000,7 +1037,24 @@ def request_with_retry(client: httpx.Client, method: str, url: str,
     """
     last: httpx.Response | None = None
     for attempt in range(max_attempts):
-        resp = client.request(method, url, **kwargs)
+        is_last = attempt == max_attempts - 1
+        try:
+            resp = client.request(method, url, **kwargs)
+        except httpx.TransportError:
+            # Dropped connections, DNS blips and read timeouts are the MOST
+            # common transient failures in a daily cron — far more common than
+            # a 503. Measured 2026-08-09: before this branch existed a 503 got
+            # four attempts and a ConnectError got exactly one. One unretried
+            # blip costs a repo its day, which resets the P0 gate's seven.
+            # httpx.TransportError covers Connect/Read/Write/Pool timeouts,
+            # NetworkError, ProtocolError and ProxyError — the whole transient
+            # network family — while leaving HTTPStatusError and InvalidURL to
+            # fail immediately, as they should.
+            if is_last:
+                raise
+            time.sleep(backoff * (2 ** attempt))
+            continue
+
         wait = _retry_after_seconds(resp)
         rate_limited = (resp.status_code in RATE_LIMIT_STATUS
                         and _looks_rate_limited(resp))
@@ -1009,7 +1063,7 @@ def request_with_retry(client: httpx.Client, method: str, url: str,
             resp.raise_for_status()
             return resp
         last = resp
-        if attempt < max_attempts - 1:
+        if not is_last:
             if wait is None:
                 wait = (RATE_LIMIT_FALLBACK_WAIT_S if rate_limited
                         else backoff * (2 ** attempt))
