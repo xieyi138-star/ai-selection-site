@@ -1,0 +1,368 @@
+# Repo roster for the AI-selection pipeline.
+#
+# HOW THIS LIST WAS BUILT (Task 2, Step 5):
+# GitHub Search API (`topic:<X>+stars:>500`, sorted by stars) was run per stage
+# as a *candidate discovery* mechanism only — never as a ranking. Search results
+# were noisy: tutorials, "awesome-*" lists, benchmarks, demo apps, and mistagged
+# repos dominate the raw output, while several of the most obvious real-world
+# candidates (vLLM, Ollama, llama.cpp, Chroma, pgvector, CrewAI, Arize Phoenix,
+# ...) were ABSENT from the topic search because GitHub topic tagging is
+# inconsistent. Supplementary topic searches plus direct `GET /repos/{o}/{n}`
+# lookups (stars, archived flag, pushed_at, topics) were used to pull in the
+# real field and check every finalist for staleness/deprecation.
+#
+# Every candidate was judged on "would a developer picking a solution for this
+# stage today genuinely put this on their shortlist", not on star count.
+# Concretely this excluded: tutorials, awesome-lists, demo/reference apps,
+# no-code/low-code app builders (Dify, Flowise, AnythingLLM, open-webui —
+# these are end-user products, not components a developer embeds), models
+# (embedding-model repos), abandoned or archived repos, and repos whose
+# maintainers have publicly redirected users elsewhere.
+#
+# Two real deprecation/redirect findings surfaced during research (documented
+# inline below): microsoft/autogen is in maintainer-declared "maintenance
+# mode" pointing to microsoft/agent-framework, and Marker-Inc-Korea/AutoRAG
+# has pivoted its main branch to a different product, freezing its original
+# RAG-optimizer identity in a legacy/ subfolder. Both were excluded on that
+# evidence rather than included on name recognition.
+#
+# PACKAGE NAMES: none were guessed. Each was read from the repo's own
+# pyproject.toml / setup.py / package.json (root or the correct monorepo
+# subpackage), or its README's documented install command, then cross-checked
+# against the live registry (PyPI/npm/Docker Hub) AND, for PyPI, against the
+# package's own author_email/project_urls/home_page to confirm the metadata
+# actually points back at this GitHub repo (not a same-named, unrelated
+# package). This caught a real collision: PyPI's "ragflow" package belongs to
+# an unrelated abandoned 2023 project by a different author, not
+# infiniflow/ragflow — see the rag section below. It also caught that PyPI's
+# "ollama" package is published from the sibling repo ollama/ollama-python,
+# not from ollama/ollama itself — see the inference section below.
+#
+# Counts: 5 use_cases, 40 repos, 20 top=true (exactly 4 per stage).
+# Per-stage totals: agent-orchestration=9, rag=6, vector-db=9, inference=8,
+# observability=8 — all within the 6-10 band. rag sits at the floor (6)
+# deliberately: several plausible-looking candidates (pathwaycom/llm-app,
+# HKUDS/RAG-Anything, Marker-Inc-Korea/AutoRAG, SciPhi-AI/R2R,
+# truefoundry/cognita) were investigated and rejected on the merits (see
+# below) rather than padded in to hit a rounder number.
+
+use_cases:
+  - id: agent-orchestration
+    name: Agent Orchestration
+    description: >
+      Frameworks that sequence LLM calls, tool use, and multi-step control
+      flow into autonomous or semi-autonomous agents.
+  - id: rag
+    name: RAG / Retrieval
+    description: >
+      Frameworks and engines that ground LLM output in external data via
+      retrieval-augmented generation.
+  - id: vector-db
+    name: Vector Database
+    description: >
+      Databases and libraries for storing and querying vector embeddings for
+      similarity search.
+  - id: inference
+    name: Inference Engine
+    description: >
+      Self-hosted engines for serving open LLMs, optimizing cost, latency,
+      and throughput.
+  - id: observability
+    name: Observability & Evaluation
+    description: >
+      Platforms for tracing, monitoring, and evaluating LLM and agent
+      applications in production.
+
+repos:
+  # ============================================================
+  # agent-orchestration (9 repos, top 4)
+  # ============================================================
+  # Design spec explicitly calls this stage out as having "the most
+  # candidates, the widest spread" of any stage — the higher-than-average
+  # count (9) reflects that, not padding; every entry below is independently
+  # differentiated (see notes).
+  #
+  # top 4 = the four most likely to be a developer's actual 2026 shortlist:
+  # LangGraph (the de facto graph-based orchestrator, huge ecosystem),
+  # CrewAI (dominant role-based multi-agent framework), OpenAI's own Agents
+  # SDK (default for OpenAI-centric stacks, successor to Swarm), and
+  # Microsoft Agent Framework (see note below on why this replaces AutoGen).
+  #
+  # NOTABLE EXCLUSION — microsoft/autogen: this is the single most
+  # name-recognized project in this space, and it was deliberately left out.
+  # Its own README (read directly, not from memory) carries a maintainer
+  # banner: "AutoGen is now in maintenance mode ... New users should start
+  # with Microsoft Agent Framework." Its GitHub pushed_at was 2026-04-15 (4
+  # months stale vs. days-old for every included repo) confirming the
+  # README claim. microsoft/agent-framework (12.7k stars, pushed yesterday,
+  # explicitly "the enterprise-ready successor to AutoGen") is included in
+  # its place. The community-governed continuation fork ag2ai/ag2 ("AG2,
+  # formerly AutoGen") was also considered — actively maintained, but a
+  # smaller, largely redundant restatement of the same role-based design
+  # CrewAI already represents in this roster — and left out.
+  # Also considered and left out: TransformerOptimus/SuperAGI (no push
+  # since 2025-01-22, ~19 months stale — abandoned), The-Pocket/PocketFlow
+  # (a deliberately minimal "100-line framework"; same author's other
+  # top-starred repo is a literal tutorial, and this reads as
+  # educational/pattern-demo rather than something teams ship on),
+  # camel-ai/camel, langroid/langroid, agentscope-ai/agentscope,
+  # strands-agents/harness-sdk, kyegomez/swarms, Significant-Gravitas/AutoGPT
+  # — all real, active, legitimate projects, but the roster already covers
+  # their niches (role-based multi-agent, memory-first, vendor-native SDK)
+  # via stronger/more-established entries, and 9 was judged the right stop
+  # point rather than 12+.
+  - slug: langchain-ai/langgraph
+    use_case: agent-orchestration
+    pypi: langgraph          # repo pyproject has no root manifest (monorepo); README: `pip install -U langgraph`
+    top: true
+  - slug: crewAIInc/crewAI
+    use_case: agent-orchestration
+    pypi: crewai             # root pyproject.toml name is the workspace marker "crewai-workspace"; README: `uv pip install crewai`
+    top: true
+  - slug: openai/openai-agents-python
+    use_case: agent-orchestration
+    pypi: openai-agents      # pyproject.toml: name = "openai-agents"
+    top: true
+  - slug: microsoft/agent-framework
+    use_case: agent-orchestration
+    pypi: agent-framework    # monorepo (python/dotnet); README: `pip install agent-framework`. See note above on why this repo, not microsoft/autogen.
+    top: true
+  - slug: google/adk-python
+    use_case: agent-orchestration
+    pypi: google-adk         # pyproject.toml: name = "google-adk"
+  - slug: microsoft/semantic-kernel
+    use_case: agent-orchestration
+    pypi: semantic-kernel    # monorepo (python/dotnet/java); README: `pip install semantic-kernel`
+  - slug: huggingface/smolagents
+    use_case: agent-orchestration
+    pypi: smolagents         # pyproject.toml: name = "smolagents"
+  - slug: agno-agi/agno
+    use_case: agent-orchestration
+    pypi: agno                # pypi name lives in libs/agno/pyproject.toml (monorepo root has no manifest): name = "agno"
+  - slug: letta-ai/letta
+    use_case: agent-orchestration
+    pypi: letta               # pyproject.toml: name = "letta"
+
+  # ============================================================
+  # rag (6 repos, top 4)
+  # ============================================================
+  # Sits at the floor of the 6-10 band deliberately. Candidates investigated
+  # and rejected rather than padded in:
+  #   - pathwaycom/llm-app (59k stars): own README calls it "ready-to-deploy
+  #     LLM App Templates" — a demo-template collection, not a framework.
+  #   - HKUDS/RAG-Anything: its own README badge reads "Based on LightRAG" —
+  #     it is an extension of an entry already in this roster (HKUDS/LightRAG),
+  #     not an independently-choosable alternative.
+  #   - Marker-Inc-Korea/AutoRAG: the GitHub search hit describes the
+  #     original tool (RAG pipeline AutoML). Reading the actual current
+  #     README shows the main branch has pivoted to "AutoRAG 2.0", a
+  #     completely different product ("a self-evolving librarian agent"
+  #     built on a coding-agent loop). The original RAG-optimizer is
+  #     explicitly frozen in a legacy/ folder ("maintenance mode... bug
+  #     fixes... no new feature development"). Excluded: what's live today
+  #     is a different kind of product than this stage needs, and what
+  #     fits the stage is frozen.
+  #   - SciPhi-AI/R2R: pushed_at 2025-11-07, ~9 months stale vs. days-old
+  #     for every included repo.
+  #   - truefoundry/cognita: archived=true (confirmed via API).
+  #
+  # top 4 = LlamaIndex, LangChain, Haystack, RAGFlow: the four most
+  # production-proven, most-documented, most-case-studied general RAG
+  # frameworks/engines as of today.
+  #
+  # Note on langchain vs. langgraph: both are langchain-ai projects, placed
+  # in different stages on purpose. LangGraph is explicitly positioned by
+  # its own maintainers as the orchestration/agent-graph runtime (its
+  # PyPI project_urls even list "rag" as a topic, but its README tagline is
+  # "Build resilient agents") -> agent-orchestration. Plain LangChain's
+  # breakout, still-dominant use case is retrieval chains / "chat with your
+  # docs" -> rag. This avoids double-counting one org twice in one stage.
+  - slug: run-llama/llama_index
+    use_case: rag
+    pypi: llama-index         # pyproject.toml: name = "llama-index" (repo is llama_index, package is llama-index — exactly the underscore/hyphen mismatch this task warned about)
+    top: true
+  - slug: langchain-ai/langchain
+    use_case: rag
+    pypi: langchain           # monorepo; libs/langchain/pyproject.toml: name = "langchain"
+    top: true
+  - slug: deepset-ai/haystack
+    use_case: rag
+    pypi: haystack-ai         # pyproject.toml: name = "haystack-ai" (NOT "haystack" — that PyPI name is a different, older package)
+    top: true
+  - slug: infiniflow/ragflow
+    use_case: rag
+    dockerhub: infiniflow/ragflow   # README's own quickstart is docker-first (badge literally reads "docker pull infiniflow/ragflow:v0.26.4"). CHECKED: pypi.org/pypi/ragflow IS live (HTTP 200) but its metadata (author "breezedeus", homepage github.com/breezedeus/ragflow, version 0.0.1 from 2023-11-20, single release) is an unrelated abandoned project that happens to share the name — NOT infiniflow's. Deliberately left pypi empty rather than attach that package.
+    top: true
+  - slug: llmware-ai/llmware
+    use_case: rag
+    pypi: llmware              # setup.py: name="llmware"
+  - slug: HKUDS/LightRAG
+    use_case: rag
+    pypi: lightrag-hku         # pyproject.toml: name = "lightrag-hku" (NOT "lightrag")
+
+  # ============================================================
+  # vector-db (9 repos, top 4)
+  # ============================================================
+  # top 4 chosen for maximum genuine differentiation rather than raw
+  # popularity: pgvector ("extend the Postgres you already run" — probably
+  # the single most-recommended default in 2026 for teams not wanting a
+  # dedicated vector DB), Qdrant (fastest-growing dedicated Rust engine),
+  # Milvus (most mature massive-scale distributed option), Chroma (the
+  # embedded, developer-first default baked into most RAG tutorials/
+  # framework quickstarts, i.e. the one most developers meet first).
+  # Weaviate is a very close 5th (equally production-grade to Qdrant/
+  # Milvus) but was placed non-top to avoid three near-identical "dedicated
+  # scalable vector DB" entries in the top slot.
+  #
+  # NOTABLE EXCLUSION — redis/redis: Redis added vector search (a real,
+  # widely-used capability), but the repo itself is the entire
+  # general-purpose Redis server — unlike pgvector/pgvector, which IS the
+  # correctly-scoped vector extension repo, there's no equivalently-scoped
+  # "just the vector part" repo for Redis to point at. Also considered:
+  # vespa-engine/vespa (legitimate, but heavier operational footprint and
+  # its historical identity is large-scale web search rather than an
+  # AI-app-developer-first tool; redundant with Qdrant/Milvus for the
+  # "dedicated scalable" niche) and marqo-ai/marqo (its own current
+  # description has narrowed to "Ecommerce Search and Discovery" — no
+  # longer positioned as a general-purpose vector DB).
+  - slug: pgvector/pgvector
+    use_case: vector-db
+    dockerhub: pgvector/pgvector   # README: "Get the Docker image ... docker pull pgvector/pgvector:pg18-trixie". No pypi/npm package — this is a Postgres C extension, not a language package.
+    top: true
+  - slug: qdrant/qdrant
+    use_case: vector-db
+    dockerhub: qdrant/qdrant       # README quickstart: `docker run -p 6333:6333 qdrant/qdrant`. Rust project, no first-party pypi package for the server itself.
+    top: true
+  - slug: milvus-io/milvus
+    use_case: vector-db
+    dockerhub: milvusdb/milvus     # README docker-pulls badge references milvusdb/milvus (note: differs from the GH org "milvus-io"). Go project, no first-party pypi package for the server.
+    top: true
+  - slug: chroma-core/chroma
+    use_case: vector-db
+    pypi: chromadb                 # pyproject.toml: name = "chromadb" (NOT "chroma")
+    top: true
+  - slug: weaviate/weaviate
+    use_case: vector-db
+    dockerhub: semitechnologies/weaviate   # own docker-compose references `semitechnologies/weaviate` (company name SeMI Technologies, differs from GH org "weaviate"); confirmed present on Docker Hub. Go project, no first-party pypi package for the server.
+  - slug: lancedb/lancedb
+    use_case: vector-db
+    pypi: lancedb                  # python/pyproject.toml (Rust+Python monorepo): name = "lancedb"
+  - slug: neuml/txtai
+    use_case: vector-db
+    pypi: txtai                    # setup.py: package = "txtai"
+  - slug: facebookresearch/faiss
+    use_case: vector-db
+    pypi: faiss-cpu                # pyproject.toml: name = "faiss-cpu" (the standard pip distribution; faiss-gpu is a separate variant)
+  - slug: typesense/typesense
+    use_case: vector-db
+    dockerhub: typesense/typesense  # README: "official Docker image" https://hub.docker.com/r/typesense/typesense, `docker run ... typesense/typesense:27.1`
+
+  # ============================================================
+  # inference (8 repos, top 4)
+  # ============================================================
+  # top 4 = vLLM (standard for GPU-served self-hosted inference), llama.cpp
+  # (standard for CPU/quantized/edge inference), Ollama (standard for local
+  # developer convenience, built on llama.cpp), SGLang (fastest-growing
+  # alternative serving engine, used by several frontier labs) — four
+  # genuinely different points on the self-hosted-inference spectrum rather
+  # than four variations on the same GPU-server theme.
+  #
+  # NOTABLE EXCLUSION — huggingface/text-generation-inference (TGI): the
+  # historical #2 to vLLM. CHECKED via the GitHub API: archived=true.
+  # Confirmed dead, not guessed.
+  # Also excluded: bentoml/BentoML (general MLOps model-serving framework;
+  # its own more-specific sibling product bentoml/OpenLLM is included
+  # instead as the on-topic "LLM inference" entry, avoiding a redundant
+  # pair from the same org) and predibase/lorax (real, but a narrower
+  # multi-LoRA-serving niche than the other 8 cover).
+  - slug: vllm-project/vllm
+    use_case: inference
+    pypi: vllm                    # pyproject.toml: name = "vllm"
+    dockerhub: vllm/vllm-openai   # confirmed via docs/deployment/docker.md: `docker run ... vllm/vllm-openai:latest`
+    top: true
+  - slug: ggml-org/llama.cpp
+    use_case: inference
+    # NO PACKAGE — confirmed, not an oversight. Repo transferred from
+    # ggerganov/llama.cpp to ggml-org/llama.cpp (GitHub API redirects the
+    # old slug; this is the current canonical name). Its own docs/docker.md
+    # documents images ONLY under ghcr.io/ggml-org/llama.cpp — GitHub
+    # Container Registry, not Docker Hub. Checked pypi.org/pypi/llama.cpp,
+    # npm, and Docker Hub directly for this repo's own name: none exist
+    # (the popular pip-installable "llama-cpp-python" is a separate,
+    # third-party-maintained repo/project, not this one, and was
+    # deliberately not attached here).
+    top: true
+  - slug: ollama/ollama
+    use_case: inference
+    dockerhub: ollama/ollama      # confirmed present on Docker Hub, matches the project's own product name exactly. CHECKED: PyPI's "ollama" package (README: `pip install ollama`) has project_urls pointing to github.com/ollama/ollama-python — a *different*, sibling repo (the Python client SDK) — not this repo, so deliberately left pypi empty here rather than attach a package published from another repo.
+    top: true
+  - slug: sgl-project/sglang
+    use_case: inference
+    pypi: sglang                  # python/pyproject.toml (monorepo): name = "sglang"
+    top: true
+  - slug: NVIDIA/TensorRT-LLM
+    use_case: inference
+    pypi: tensorrt-llm            # docs/source/installation/installation-guide.md: `pip3 install tensorrt_llm`; PyPI's own canonical info.name is "tensorrt-llm". Confirmed authentic: PyPI author = "NVIDIA Corporation", homepage = github.com/NVIDIA/TensorRT-LLM. Primary distribution is actually NGC container registry (nvcr.io, not Docker Hub) per the same doc, so dockerhub left empty rather than attach an unverified same-named Docker Hub repo.
+  - slug: mlc-ai/mlc-llm
+    use_case: inference
+    # NO PACKAGE — confirmed, not an oversight. pyproject.toml declares
+    # name = "mlc_llm" but that name does not resolve on pypi.org (checked
+    # both mlc-llm and mlc_llm: HTTP 404). Their own install docs
+    # (llm.mlc.ai/docs/install/mlc_llm) use a custom wheel index instead of
+    # PyPI: `pip install -f https://mlc.ai/wheels mlc-llm-nightly-cpu ...`.
+    # Also checked and confirmed absent from Docker Hub under mlc-ai/mlc-llm
+    # and mlcai/mlc-llm.
+  - slug: InternLM/lmdeploy
+    use_case: inference
+    pypi: lmdeploy                 # README: "pip install lmdeploy" (PyPI storage-quota note in the README confirms this is actively published); author_email openmmlab@gmail.com matches the OpenMMLab parent org.
+  - slug: bentoml/OpenLLM
+    use_case: inference
+    pypi: openllm                  # pyproject.toml: name = "openllm"
+
+  # ============================================================
+  # observability (8 repos, top 4)
+  # ============================================================
+  # top 4 = Langfuse (category leader by adoption breadth), Opik
+  # (Comet-backed, established MLOps-company credibility), Arize Phoenix
+  # (Arize-backed, deep evaluation focus), Helicone (popular gateway +
+  # observability combo) — the four most commonly evaluated "first stop"
+  # LLM observability platforms in current developer discourse.
+  #
+  # This stage had the largest pool of plausible, active, genuinely
+  # differentiated candidates of all five (11 were seriously considered).
+  # Cut for redundancy with the top-4 tracing-platform cluster or for a
+  # weaker fit to "LLM observability" specifically (own identity is a much
+  # broader/older/more general product with LLM features added later):
+  # mlflow/mlflow, lmnr-ai/lmnr, Giskard-AI/giskard-oss. Cut for staleness:
+  # Scale3-Labs/langtrace (pushed_at 2025-11-17, ~9 months stale, also the
+  # smallest by stars of the group) and vibrantlabsai/ragas (pushed_at
+  # 2026-02-24, ~5.5 months stale).
+  - slug: langfuse/langfuse
+    use_case: observability
+    pypi: langfuse                 # README: "pip install langfuse openai"; PyPI author_email = "langfuse <developers@langfuse.com>"
+    dockerhub: langfuse/langfuse   # root package.json is "private": true (monorepo marker); README docker-pulls badge references langfuse/langfuse directly, confirmed present on Docker Hub
+    top: true
+  - slug: comet-ml/opik
+    use_case: observability
+    pypi: opik                     # sdks/python/setup.py (monorepo): name="opik"
+    top: true
+  - slug: Arize-ai/phoenix
+    use_case: observability
+    pypi: arize-phoenix            # pyproject.toml: name = "arize-phoenix" (NOT "phoenix")
+    top: true
+  - slug: Helicone/helicone
+    use_case: observability
+    dockerhub: helicone/helicone-all-in-one   # root package.json is "helicone-monorepo" (marker, not published). Confirmed via the repo's own docker/push_docker.sh, which explicitly lists the images it publishes to Docker Hub: helicone/web, helicone/jawn, helicone/migrations, helicone/helicone-all-in-one, helicone/ai-gateway. Used the all-in-one self-host image as the single representative signal (a plain "helicone/helicone" repo also happens to exist on Docker Hub, but is NOT one of the images this script actually publishes, so it was not used).
+    top: true
+  - slug: traceloop/openllmetry
+    use_case: observability
+    pypi: traceloop-sdk            # monorepo; packages/traceloop-sdk/pyproject.toml: name = "traceloop-sdk"
+  - slug: pydantic/logfire
+    use_case: observability
+    pypi: logfire                  # pyproject.toml: name = "logfire"
+  - slug: promptfoo/promptfoo
+    use_case: observability
+    npm: promptfoo                 # package.json: "name": "promptfoo" (not marked private); confirmed on npm registry with repository pointing at github.com/promptfoo/promptfoo
+  - slug: confident-ai/deepeval
+    use_case: observability
+    pypi: deepeval                 # pyproject.toml: name = "deepeval"
