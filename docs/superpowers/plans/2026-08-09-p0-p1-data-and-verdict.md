@@ -15,7 +15,7 @@
 ## Global Constraints
 
 - Python **3.12**（本机实测 3.12.10）。不使用 3.13+ 语法。
-- **数据库用 SQLite**，经 SQLAlchemy 2.x ORM 访问。规格 §11 写的是 Postgres；40 repo × 365 天 ≈ 1.5 万行，SQLite 完全够用且零安装。P2 建站时换 Postgres 只需改连接串。**业务代码中不得出现任何 SQLite 专有 SQL。**
+- **数据库用 SQLite**，经 SQLAlchemy 2.x ORM 访问。规格 §11 写的是 Postgres；40 repo × 365 天 × 约 12 个指标 ≈ **17.9 万行/年**（长表每仓库每天约 12 行，不是 1 行——原估算差 12 倍，2026-08-09 实测更正），SQLite 仍完全够用且零安装。P2 建站时换 Postgres 只需改连接串。**业务代码中不得出现任何 SQLite 专有 SQL。**
   **例外**：为**消除方言行为差异**而做的连接期配置是允许且必需的，须按 `engine.dialect.name` 分支并注释说明。目前仅一处：SQLite 的 `PRAGMA foreign_keys=ON`（pysqlite 默认关闭外键，Postgres 默认开启；不开会让 dev/test 静默接受 prod 会拒绝的孤儿行）。这类配置服务于本约束的**目的**——不让 dev 与 prod 行为分叉——而不是违反它。
 - **不使用 BigQuery。** 规格 §4.1 原定 PyPI 走 BigQuery；实测其 `file_downloads` 表按日分区即达数十 GB，按日查询一个月会耗尽 1TB/月免费额度。改用 `pypistats.org` API（180 天日粒度、免费、限速 ~30 req/min）。**趋势窗口因此为 180 天，不是 12 个月，页面上必须如实标注为 "180d trend"。**
 - **本机无 Docker**（实测 `docker` not found）。所有 quickstart 实跑只在 GitHub Actions `ubuntu-latest` runner 上执行，该 runner 预装 Docker。**任何任务都不得要求本地起容器。**
@@ -2139,7 +2139,9 @@ git commit -m "feat: daily collection pipeline with per-repo failure isolation"
 - Consumes: `aisel.pipeline`（Task 6）
 - Produces: 每日运行后把 `data/aisel.db` 提交回仓库，供后续任务与 P1b 直接读取
 
-> 数据库随仓库走：40 repo × 365 天 ≈ 1.5 万行、体积在数 MB 量级，提交进 git 最省事，也让每日快照天然带版本历史。P2 换 Postgres 时替换本 workflow。
+> 数据库随仓库走：提交进 git 最省事，也让每日快照天然带版本历史。P2 换 Postgres 时替换本 workflow。
+>
+> **实测容量（2026-08-09，克隆真实库插入合成日验证）**：约 490 行/天 ≈ **17.9 万行/年**，文件增长 **41–45 KB/天 ≈ 15 MB/年**。另测出日间约 **45% 的 SQLite 页被重写**——新日期在 `uq_metric_point` 索引里与既有 `repo_id` 交错，触发 B-tree 页分裂，不是尾部追加——所以 **git 无法有效增量压缩**，每次提交接近存一个新 blob。距 GitHub 单文件 100MB 上限尚有 6 年以上，在本设计的既定寿命（P2 之前）内不构成问题，但这是 P2 换 Postgres 的理由之一。
 
 - [ ] **Step 1: 改 `.gitignore`，把数据库放行**
 
