@@ -52,6 +52,7 @@
 | `src/aisel/scoring/confidence.py` | 置信度分级 |
 | `src/aisel/scoring/verdict.py` | 生成 verdict + 依据快照 |
 | `src/aisel/render/stage_page.py` | verdict → 环节页 markdown |
+| `scripts/verify_packages.py` | HTTP 实证每个声明的包名真实存在（测试抓不到的错误类别） |
 | `scripts/gate_p0.py` | P0 关口验证 |
 | `scripts/calibrate.py` | 阈值标定：打印真实数据分布 |
 | `.github/workflows/collect.yml` | 每日采集 |
@@ -583,7 +584,7 @@ done
 
 环节 id 固定为：`agent-orchestration` / `rag` / `vector-db` / `inference` / `observability`。
 
-- [ ] **Step 6: 校验清单**
+- [ ] **Step 6: 校验清单结构**
 
 Run:
 ```bash
@@ -595,6 +596,77 @@ from collections import Counter; print(Counter(x.use_case_id for x in r))
 "
 ```
 Expected: `use_cases: 5`、`repos: 40`、`top: 20`，且每个环节的计数在 6–10 之间。
+
+- [ ] **Step 6b: 逐个包名 HTTP 实证（不可跳过）**
+
+**这一步不能靠肉眼核对。** 包名写错一个，那个 repo 的下载量永远取不到 → 采用量永远判为 `unknown` → 判优静默把它降级，而且**单元测试永远抓不到**，因为测试用的是 mock。把「我核对过了」变成「HTTP 说它存在」。
+
+创建 `scripts/verify_packages.py`：
+
+```python
+"""Prove every declared package name resolves. A typo here is invisible to the
+test suite (collectors are mocked) and silently zeroes a repo's adoption axis."""
+from __future__ import annotations
+
+import argparse
+import sys
+
+import httpx
+
+from aisel.config import load_repos
+
+ENDPOINTS = {
+    "pypi": "https://pypi.org/pypi/{}/json",
+    "npm": "https://registry.npmjs.org/{}",
+    "dockerhub": "https://hub.docker.com/v2/repositories/{}/",
+}
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", default="config/repos.yaml")
+    args = parser.parse_args()
+
+    bad: list[str] = []
+    signalless: list[str] = []
+
+    with httpx.Client(timeout=30, follow_redirects=True) as client:
+        for spec in load_repos(args.config):
+            slug = f"{spec.owner}/{spec.name}"
+            declared = {
+                "pypi": spec.pypi_package,
+                "npm": spec.npm_package,
+                "dockerhub": spec.dockerhub_repo,
+            }
+            if not any(declared.values()):
+                signalless.append(slug)
+                continue
+            for kind, value in declared.items():
+                if not value:
+                    continue
+                url = ENDPOINTS[kind].format(value)
+                resp = client.get(url)
+                if resp.status_code != 200:
+                    bad.append(f"{slug}  {kind}={value}  HTTP {resp.status_code}  {url}")
+
+    for slug in signalless:
+        print(f"NO-PACKAGE  {slug}  -> adoption axis will be 'unknown' (allowed, must be deliberate)")
+    for line in bad:
+        print(f"BAD  {line}")
+    print(f"\n{len(bad)} bad, {len(signalless)} without any package")
+    return 1 if bad else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+```
+
+Run: `python scripts/verify_packages.py`
+Expected: **退出码 0，零条 `BAD`**。
+
+任一 404 → 那个包名是错的。**回去查真实包名（到 pypi.org / npmjs.com 搜该项目），不要删掉字段了事**——删字段等于永久放弃该 repo 的采用量信号。
+
+`NO-PACKAGE` 行是允许的（ComfyUI 这类纯 GitHub 项目确实不发包），但每一条都必须是**你确认过它确实不发包**，而不是懒得填。把确认过的写进 `repos.yaml` 注释。
 
 - [ ] **Step 7: 提交**
 
