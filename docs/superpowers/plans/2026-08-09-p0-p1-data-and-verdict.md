@@ -802,6 +802,75 @@ def test_bare_403_fails_immediately_instead_of_being_retried():
     assert route.call_count == 1  # not retried
 
 
+@respx.mock
+def test_retry_after_http_date_without_offset_does_not_crash_the_retry_layer(monkeypatch):
+    """RFC 2822 allows a date with no explicit offset; parsedate_to_datetime
+    returns a NAIVE datetime for it, and subtracting that from an aware now()
+    raises TypeError. This helper runs on EVERY response, so raising here would
+    take down the whole retry layer — the exact failure it exists to prevent."""
+    from email.utils import format_datetime
+
+    slept: list[float] = []
+    monkeypatch.setattr(time, "sleep", slept.append)
+    # format_datetime always emits RFC 2822 in English regardless of locale;
+    # strftime("%a %b") would produce unparseable names on a non-English host.
+    future = format_datetime(
+        dt.datetime.now(dt.UTC) + dt.timedelta(seconds=30)
+    ).replace(" +0000", "")  # deliberately strip the offset
+    route = respx.get("https://api.example/date").mock(side_effect=[
+        httpx.Response(403, headers={"Retry-After": future}, json={}),
+        httpx.Response(200, json={"ok": True}),
+    ])
+    with httpx.Client() as c:
+        assert request_json(c, "GET", "https://api.example/date") == {"ok": True}
+    assert route.call_count == 2
+    assert 0 < slept[0] <= 30
+
+
+@respx.mock
+def test_absurd_retry_after_falls_back_instead_of_sleeping_forever(monkeypatch):
+    """float('inf') parses fine and would sleep until the heat death."""
+    slept: list[float] = []
+    monkeypatch.setattr(time, "sleep", slept.append)
+    respx.get("https://api.example/inf").mock(side_effect=[
+        httpx.Response(503, headers={"Retry-After": "inf"}, json={}),
+        httpx.Response(200, json={"ok": True}),
+    ])
+    with httpx.Client() as c:
+        assert request_json(c, "GET", "https://api.example/inf") == {"ok": True}
+    assert slept == [1.0]  # fell back to backoff, did not honour "inf"
+
+
+@respx.mock
+def test_secondary_limit_403_without_retry_after_is_still_retried(monkeypatch):
+    """GitHub's own docs: on a secondary limit "if the retry-after response
+    header is present..." — i.e. it is conditional. x-ratelimit-remaining: 0 and
+    the message body are the documented fallbacks. Treating such a 403 as a dead
+    token would abandon a repo that merely needed to wait."""
+    slept: list[float] = []
+    monkeypatch.setattr(time, "sleep", slept.append)
+    route = respx.get("https://api.example/sec").mock(side_effect=[
+        httpx.Response(403, headers={"x-ratelimit-remaining": "0"}, json={}),
+        httpx.Response(200, json={"ok": True}),
+    ])
+    with httpx.Client() as c:
+        assert request_json(c, "GET", "https://api.example/sec") == {"ok": True}
+    assert route.call_count == 2
+    assert slept == [60.0]  # GitHub: "wait for at least one minute"
+
+
+@respx.mock
+def test_secondary_limit_detected_from_the_message_body(monkeypatch):
+    monkeypatch.setattr(time, "sleep", lambda _s: None)
+    route = respx.get("https://api.example/body").mock(side_effect=[
+        httpx.Response(403, json={"message": "You have exceeded a secondary rate limit"}),
+        httpx.Response(200, json={"ok": True}),
+    ])
+    with httpx.Client() as c:
+        assert request_json(c, "GET", "https://api.example/body") == {"ok": True}
+    assert route.call_count == 2
+
+
 def _seed(engine):
     with session_scope(engine) as s:
         s.add(UseCase(id="u", name="U", description=""))
@@ -837,6 +906,7 @@ Expected: FAIL — `ModuleNotFoundError: No module named 'aisel.collectors'`
 from __future__ import annotations
 
 import datetime as dt
+import math
 import time
 from email.utils import parsedate_to_datetime
 
@@ -847,24 +917,71 @@ from aisel.db import session_scope
 from aisel.models import MetricDaily
 
 RETRY_STATUS = {429, 500, 502, 503, 504}
+RATE_LIMIT_STATUS = {403, 429}
+
+# A server-supplied wait longer than this is not a retry, it is a hang. The
+# pipeline isolates a failed repo and retries tomorrow; blocking the whole run
+# for an hour is worse than losing one repo for a day.
+MAX_RETRY_AFTER_S = 300.0
+# GitHub: "Otherwise, wait for at least one minute before retrying."
+RATE_LIMIT_FALLBACK_WAIT_S = 60.0
+
+
+def _sane_delay(seconds: float) -> float | None:
+    """Clamp a server-supplied delay. inf/nan would sleep forever."""
+    if not math.isfinite(seconds):
+        return None
+    return min(max(seconds, 0.0), MAX_RETRY_AFTER_S)
 
 
 def _retry_after_seconds(resp: httpx.Response) -> float | None:
-    """Seconds GitHub asked us to wait, or None if it did not ask."""
+    """Seconds the server asked us to wait, or None if it did not ask.
+
+    **Must never raise.** This runs on every response, including 200s, so an
+    exception here would take down the whole retry layer — precisely the
+    failure the retry layer exists to prevent.
+    """
     raw = resp.headers.get("Retry-After")
     if raw is None:
         return None
     try:
-        return max(float(raw), 0.0)
+        seconds = float(raw)
     except ValueError:
         pass
+    else:
+        return _sane_delay(seconds)
     try:
         when = parsedate_to_datetime(raw)
     except (TypeError, ValueError):
         return None
     if when is None:
         return None
-    return max((when - dt.datetime.now(dt.UTC)).total_seconds(), 0.0)
+    if when.tzinfo is None:
+        # RFC 2822 permits "-0000" (UTC, sender's zone unknown) and bare dates;
+        # parsedate_to_datetime returns a NAIVE datetime for those, and
+        # subtracting it from an aware now() raises TypeError. Treat as UTC.
+        when = when.replace(tzinfo=dt.UTC)
+    return _sane_delay((when - dt.datetime.now(dt.UTC)).total_seconds())
+
+
+def _looks_rate_limited(resp: httpx.Response) -> bool:
+    """Is this 403/429 GitHub's secondary rate limit rather than a dead token?
+
+    Per GitHub's "About secondary rate limits", Retry-After is only sometimes
+    present; x-ratelimit-remaining: 0 and the message body are the documented
+    fallbacks. A 403 matching none of these is a broken credential and must
+    fail immediately — retrying it would disguise "the token is dead" as
+    "the collector is slow", and we would not find out for days.
+    """
+    if resp.headers.get("Retry-After") is not None:
+        return True
+    if resp.headers.get("x-ratelimit-remaining") == "0":
+        return True
+    try:
+        body = resp.text[:500].lower()
+    except Exception:  # noqa: BLE001 - a body we cannot read is not evidence
+        return False
+    return "secondary rate limit" in body or "abuse detection" in body
 
 
 def request_with_retry(client: httpx.Client, method: str, url: str,
@@ -885,17 +1002,18 @@ def request_with_retry(client: httpx.Client, method: str, url: str,
     for attempt in range(max_attempts):
         resp = client.request(method, url, **kwargs)
         wait = _retry_after_seconds(resp)
-        # 403 + Retry-After is GitHub's secondary rate limit. A bare 403 (dead
-        # token, no access) must fail immediately and loudly — retrying it would
-        # disguise a broken credential as slowness.
-        retryable = resp.status_code in RETRY_STATUS or (
-            resp.status_code == 403 and wait is not None)
+        rate_limited = (resp.status_code in RATE_LIMIT_STATUS
+                        and _looks_rate_limited(resp))
+        retryable = resp.status_code in RETRY_STATUS or rate_limited
         if not retryable:
             resp.raise_for_status()
             return resp
         last = resp
         if attempt < max_attempts - 1:
-            time.sleep(wait if wait is not None else backoff * (2 ** attempt))
+            if wait is None:
+                wait = (RATE_LIMIT_FALLBACK_WAIT_S if rate_limited
+                        else backoff * (2 ** attempt))
+            time.sleep(wait)
     assert last is not None
     last.raise_for_status()
     raise RuntimeError("unreachable")
@@ -930,7 +1048,7 @@ def write_metrics(engine: Engine, repo_id: int, date: dt.date,
 - [ ] **Step 4: 跑测试确认通过**
 
 Run: `python -m pytest tests/test_base.py -v`
-Expected: 6 passed
+Expected: 10 passed
 
 - [ ] **Step 5: 写失败的测试 `tests/test_github_activity.py`**
 
@@ -1308,6 +1426,12 @@ MAX_PAGES = 40
 PAGE_DELAY_S = 1.0
 NO_SAMPLE = -1.0
 
+# Why comments(first:5): we need the first comment by someone other than the
+# issue author, so the window only has to outlast a reporter's own follow-ups.
+# Measured 2026-08-09 across all 3,234 issues in the 90-day windows of langgraph,
+# vllm and llama.cpp: widening 5 -> 15 reclassifies 2 issues (0.19% of the
+# no-response bucket). Issues with 5+ leading author-only comments are rare
+# (0 / 0 / 3 respectively) and mostly never got an external reply anyway.
 QUERY = """
 query($owner:String!, $name:String!, $cursor:String) {
   repository(owner:$owner, name:$name) {
@@ -1358,7 +1482,14 @@ def collect(client: httpx.Client, owner: str, name: str,
             json={"query": QUERY,
                   "variables": {"owner": owner, "name": name, "cursor": cursor}},
         )
-        issues = payload["data"]["repository"]["issues"]
+        # GraphQL answers errors with HTTP 200 and a null payload, which would
+        # otherwise surface as a bare TypeError several frames away.
+        if payload.get("errors"):
+            raise RuntimeError(f"GraphQL error for {owner}/{name}: {payload['errors']}")
+        repository = (payload.get("data") or {}).get("repository")
+        if repository is None:
+            raise RuntimeError(f"GraphQL returned no repository for {owner}/{name}")
+        issues = repository["issues"]
         stop = False
         for issue in issues["nodes"]:
             if _ts(issue["createdAt"]) < cutoff:
