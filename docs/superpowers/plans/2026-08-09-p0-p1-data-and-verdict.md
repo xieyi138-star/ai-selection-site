@@ -1596,6 +1596,7 @@ git commit -m "feat: issue responsiveness collector via graphql"
 import datetime as dt
 
 import httpx
+import pytest
 import respx
 
 from aisel.collectors.downloads import collect
@@ -1612,10 +1613,16 @@ def _spec(**kw):
 @respx.mock
 def test_pypi_splits_recent_and_previous_windows():
     days = []
-    # 60 days: older 30 at 100/day, newer 30 at 200/day
+    # 60 days: older 30 at 100/day, newer 30 at 200/day.
+    # Each date carries BOTH categories, as the real API does. The mirror rows
+    # are ten times larger, so a wrong filter fails loudly (66000/33000) rather
+    # than being off by a plausible-looking few percent.
     for i in range(60):
         d = dt.date(2026, 6, 11) + dt.timedelta(days=i)
-        days.append({"date": d.isoformat(), "downloads": 100 if i < 30 else 200,
+        n = 100 if i < 30 else 200
+        days.append({"date": d.isoformat(), "downloads": n,
+                     "category": "without_mirrors"})
+        days.append({"date": d.isoformat(), "downloads": n * 10,
                      "category": "with_mirrors"})
     respx.get("https://pypistats.org/api/packages/langgraph/overall").mock(
         return_value=httpx.Response(200, json={"data": days}))
@@ -1631,7 +1638,9 @@ def test_pypi_splits_recent_and_previous_windows():
 def test_npm_and_dockerhub_are_collected_when_configured():
     respx.get(url__regex=r"https://api\.npmjs\.org/downloads/range/.*").mock(
         return_value=httpx.Response(200, json={"downloads": [
-            {"day": (dt.date(2026, 6, 12) + dt.timedelta(days=i)).isoformat(),
+            # Must start at prev_start (today - 60d), same as the pypi fixture.
+            # Starting a day later silently yields 29 days in the prev window.
+            {"day": (dt.date(2026, 6, 11) + dt.timedelta(days=i)).isoformat(),
              "downloads": 10}
             for i in range(60)
         ]}))
@@ -1649,8 +1658,31 @@ def test_npm_and_dockerhub_are_collected_when_configured():
 
 
 def test_repo_with_no_packages_yields_empty_dict():
+    """"No package declared" is a measurement, not a failure — the scoring layer
+    maps the empty result to unknown confidence. This is the one case where
+    returning nothing is correct rather than a swallowed error."""
     with httpx.Client() as c:
         assert collect(c, _spec(), today=dt.date(2026, 8, 10)) == {}
+
+
+@respx.mock
+def test_malformed_pypistats_payload_raises_instead_of_reporting_zero():
+    """A shape change upstream must not read as "this package has no downloads".
+    Zero is a plausible, publishable, wrong number — CONSTITUTION.md rule 2."""
+    respx.get("https://pypistats.org/api/packages/langgraph/overall").mock(
+        return_value=httpx.Response(200, json={"unexpected": "shape"}))
+    with httpx.Client() as c:
+        with pytest.raises(KeyError):
+            collect(c, _spec(pypi_package="langgraph"), today=dt.date(2026, 8, 10))
+
+
+@respx.mock
+def test_malformed_npm_payload_raises_instead_of_reporting_zero():
+    respx.get(url__regex=r"https://api\.npmjs\.org/downloads/range/.*").mock(
+        return_value=httpx.Response(200, json={"error": "package not found"}))
+    with httpx.Client() as c:
+        with pytest.raises(KeyError):
+            collect(c, _spec(npm_package="nope"), today=dt.date(2026, 8, 10))
 ```
 
 - [ ] **Step 2: 跑测试确认失败**
@@ -1692,7 +1724,12 @@ def _pypi(client: httpx.Client, pkg: str, today: dt.date) -> dict[str, float]:
     payload = request_json(client, "GET", PYPISTATS.format(pkg=pkg))
     series: dict[dt.date, float] = {}
     for row in payload["data"]:
-        if row.get("category") not in (None, "with_mirrors"):
+        # Every date appears twice, once per category. Take without_mirrors:
+        # mirror traffic is bulk-sync bots, not somebody installing the package,
+        # and this axis exists to measure real adoption rather than volume.
+        # It is also the number pypistats.org itself displays — a reader who
+        # checks our figure against the public page must find them equal.
+        if row.get("category") not in (None, "without_mirrors"):
             continue
         series[dt.date.fromisoformat(row["date"])] = float(row["downloads"])
     recent, prev = _split_windows(series, today)
