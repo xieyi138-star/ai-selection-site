@@ -3015,6 +3015,25 @@ git commit -m "ci: weekly quickstart runs with p1a gate"
 
 ## Task 12: 四轴评级与阈值标定
 
+> ⛔ **本任务的阈值设计已被真实数据证伪，施工前必须重做。**（2026-08-09，`scripts/preview_verdicts.py` 跑真实 40 仓库快照）
+>
+> 按下方现有写法产出的结论是：**五个环节首选数 0，40 个仓库里 17 个判 `avoid`**——其中包括 pgvector、Chroma、Milvus、FAISS、LlamaIndex、LangGraph。这个结论过不了 P1b 关口的任何一段。
+>
+> **病根是结构性的，不是 bug、也不是数据问题**，三条叠加产生数学必然：
+> 1. band 取的是**本 roster 的分位数** → 按定义就有 25% 在每条轴上是 weak，哪怕 40 个全是好工具；
+> 2. `alive`（3 个子信号）与 `responsive`（2 个）取**最差档**；
+> 3. `avoid` 的触发条件是**任一 weak**。
+>
+> 于是「在这 40 个里排后四分之一」被翻译成了「别用」。`pgvector` 是最清楚的例子：它 alive=weak，只因为一个成熟稳定的 Postgres 扩展不像疯狂迭代的 AI 框架那样天天提交——那是**成熟**，不是**将死**。
+>
+> **重做要求：**
+> - band 必须是**有现实含义的绝对阈值**（「半年没发 release」「issue 中位响应超过一周」），不是 roster 相对分位数。分位数可以用来**参考**该把绝对线画在哪，但不能**就是**那条线。
+> - `avoid` 的门槛要远高于「有一条子信号 weak」。
+> - 重新审视 `alive` 的取最差：**成熟项目的低提交量不是生命体征衰竭**。
+> - 某渠道样本不足以标定（实测 npm 只有 1 个包）→ 该渠道判 `unknown`。**绝不借用别的渠道的阈值**，单位不同。
+>
+> 下方代码块保留作参考，但**不得照抄施工**。重做时机：真实数据已在手，随时可做，但要作为一次带审查的完整改版。
+
 **Files:**
 - Create: `src/aisel/scoring/__init__.py`, `src/aisel/scoring/axes.py`, `scripts/calibrate.py`
 - Test: `tests/test_axes.py`
