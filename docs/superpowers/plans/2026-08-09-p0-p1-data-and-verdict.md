@@ -3228,7 +3228,15 @@ git commit -m "feat: stage page markdown rendering and build script"
 
 ---
 
-## Task 16: 盲测执行与 P1b 关口
+## Task 16: P1b 验证执行与关口
+
+> ⚠️ **本任务待重写（2026-08-09 决定）。** 原设计的「盲测 5 个开发者」已废弃——冷启动招募 5 个英文开发者对单人创始人不可执行。规格 §1 已改为两段串行：**段 B 文献反证（自动化）→ 段 A 公开发帖**。下方内容是旧版，执行到本任务前必须按规格 §1 重写；`tally.py` 的判定逻辑、`protocol.md` 的内容、以及关口判据全部要换。**在重写前不要按下方步骤施工。**
+>
+> 重写时机定在 Task 15 完成之后——那时已能看到真实环节页长什么样，失败条件才写得具体。
+
+### 旧版内容（作废，仅供改写时参考）
+
+## Task 16-OLD: 盲测执行与 P1b 关口
 
 **Files:**
 - Create: `blindtest/protocol.md`, `blindtest/records/README.md`, `blindtest/tally.py`
