@@ -2162,9 +2162,21 @@ on:
 permissions:
   contents: write
 
+# Two runs in flight at once (a manual dispatch overlapping the scheduled run)
+# would have the second one's push rejected non-fast-forward, discarding that
+# day's collection. The P0 gate needs seven CONSECUTIVE days, so a lost day is
+# a lost week. cancel-in-progress stays false: finishing the run already
+# underway is worth more than starting the newer one.
+concurrency:
+  group: collect
+  cancel-in-progress: false
+
 jobs:
   collect:
     runs-on: ubuntu-latest
+    # A full run measured 12 min locally. This is a backstop against a hung
+    # request holding a runner for six hours, not a performance target.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
 
@@ -2197,6 +2209,10 @@ jobs:
           git config user.email "aisel-bot@users.noreply.github.com"
           git add data/aisel.db
           git diff --staged --quiet || git commit -m "chore: metrics snapshot $(date -u +%F)"
+          # Rebase before pushing. `concurrency` stops this workflow racing
+          # itself, but a human merge to the default branch can still land
+          # between checkout and push — and a rejected push throws the day away.
+          git pull --rebase --autostash
           git push
 ```
 
