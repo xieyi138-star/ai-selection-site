@@ -733,6 +733,7 @@ git commit -m "feat: repo roster config with validation and db sync"
 
 ```python
 import datetime as dt
+import time
 
 import httpx
 import pytest
@@ -774,6 +775,33 @@ def test_request_json_raises_after_exhausting_retries():
         request_json(c, "GET", "https://api.example/y", max_attempts=2)
 
 
+@respx.mock
+def test_secondary_rate_limit_403_is_retried_and_obeys_retry_after(monkeypatch):
+    """GitHub answers a tripped secondary limit with 403 + Retry-After: 60.
+    Measured on vllm 2026-08-09. Exponential backoff tops out near 4s here, so
+    guessing the wait instead of reading the header simply fails."""
+    slept: list[float] = []
+    monkeypatch.setattr(time, "sleep", slept.append)
+    route = respx.get("https://api.example/rl").mock(side_effect=[
+        httpx.Response(403, headers={"Retry-After": "60"}, json={}),
+        httpx.Response(200, json={"ok": True}),
+    ])
+    with httpx.Client() as c:
+        assert request_json(c, "GET", "https://api.example/rl") == {"ok": True}
+    assert route.call_count == 2
+    assert slept == [60.0]  # obeyed the header, did not use backoff
+
+
+@respx.mock
+def test_bare_403_fails_immediately_instead_of_being_retried():
+    """A dead token must surface as an error, not be disguised as slowness."""
+    route = respx.get("https://api.example/forbidden").mock(
+        return_value=httpx.Response(403, json={"message": "Bad credentials"}))
+    with httpx.Client() as c, pytest.raises(httpx.HTTPStatusError):
+        request_json(c, "GET", "https://api.example/forbidden")
+    assert route.call_count == 1  # not retried
+
+
 def _seed(engine):
     with session_scope(engine) as s:
         s.add(UseCase(id="u", name="U", description=""))
@@ -810,6 +838,7 @@ from __future__ import annotations
 
 import datetime as dt
 import time
+from email.utils import parsedate_to_datetime
 
 import httpx
 from sqlalchemy import Engine
@@ -820,24 +849,53 @@ from aisel.models import MetricDaily
 RETRY_STATUS = {429, 500, 502, 503, 504}
 
 
+def _retry_after_seconds(resp: httpx.Response) -> float | None:
+    """Seconds GitHub asked us to wait, or None if it did not ask."""
+    raw = resp.headers.get("Retry-After")
+    if raw is None:
+        return None
+    try:
+        return max(float(raw), 0.0)
+    except ValueError:
+        pass
+    try:
+        when = parsedate_to_datetime(raw)
+    except (TypeError, ValueError):
+        return None
+    if when is None:
+        return None
+    return max((when - dt.datetime.now(dt.UTC)).total_seconds(), 0.0)
+
+
 def request_with_retry(client: httpx.Client, method: str, url: str,
                        max_attempts: int = 4, backoff: float = 1.0,
                        **kwargs) -> httpx.Response:
     """Retrying request that returns the Response, for callers needing headers.
 
-    Nothing may bypass this: an unretried transient 5xx costs one repo a day of
+Expected: 6 passed
     data, which breaks the P0 gate's 7-consecutive-days requirement and restarts
     the clock.
+
+    Honours Retry-After when GitHub sends it. Measured 2026-08-09: paginating
+    vllm's issues tripped GitHub's secondary rate limit at page 18 with
+    `403 Retry-After: 60`. Exponential backoff caps out around 4s here, so
+    guessing the wait instead of reading it simply fails.
     """
     last: httpx.Response | None = None
     for attempt in range(max_attempts):
         resp = client.request(method, url, **kwargs)
-        if resp.status_code not in RETRY_STATUS:
+        wait = _retry_after_seconds(resp)
+        # 403 + Retry-After is GitHub's secondary rate limit. A bare 403 (dead
+        # token, no access) must fail immediately and loudly — retrying it would
+        # disguise a broken credential as slowness.
+        retryable = resp.status_code in RETRY_STATUS or (
+            resp.status_code == 403 and wait is not None)
+        if not retryable:
             resp.raise_for_status()
             return resp
         last = resp
         if attempt < max_attempts - 1:
-            time.sleep(backoff * (2 ** attempt))
+            time.sleep(wait if wait is not None else backoff * (2 ** attempt))
     assert last is not None
     last.raise_for_status()
     raise RuntimeError("unreachable")
@@ -1189,7 +1247,7 @@ def test_counts_closed_issues_in_window():
 
 
 @respx.mock
-def test_truncated_window_raises_rather_than_reporting_a_partial_count():
+def test_truncated_window_raises_rather_than_reporting_a_partial_count(monkeypatch):
     """Exhausting MAX_PAGES before reaching the cutoff means every count is an
     undercount — and the surviving sample is the NEWEST issues, which are
     systematically less likely to be closed, so the close ratio would be biased
@@ -1197,6 +1255,8 @@ def test_truncated_window_raises_rather_than_reporting_a_partial_count():
     issues/90d, llama.cpp 1281, ollama 675.
     """
     import aisel.collectors.github_issues as gi
+
+    monkeypatch.setattr(gi, "PAGE_DELAY_S", 0.0)  # 40 pages x 1s would stall the suite
 
     # Every page: full, entirely in-window, and claiming another page follows.
     page = {"data": {"repository": {"issues": {
@@ -1225,6 +1285,7 @@ from __future__ import annotations
 
 import datetime as dt
 import statistics
+import time
 
 import httpx
 
@@ -1241,6 +1302,10 @@ PAGE_SIZE = 100
 # downward exactly for high-traffic repos. Pages are only fetched until the
 # cutoff is reached, so this ceiling costs nothing for the small repos.
 MAX_PAGES = 40
+# Retry recovers from the secondary rate limit; throttling avoids provoking it.
+# Measured 2026-08-09: 17 back-to-back GraphQL pages against vllm tripped it.
+# Only the few high-traffic repos pay this — everyone else exits after one page.
+PAGE_DELAY_S = 1.0
 NO_SAMPLE = -1.0
 
 QUERY = """
@@ -1312,6 +1377,7 @@ def collect(client: httpx.Client, owner: str, name: str,
             covered = True
             break
         cursor = page["endCursor"]
+        time.sleep(PAGE_DELAY_S)
 
     if not covered:
         # Ran out of pages before reaching the cutoff. Every count below would
