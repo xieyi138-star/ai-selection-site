@@ -96,7 +96,24 @@ def request_with_retry(client: httpx.Client, method: str, url: str,
     """
     last: httpx.Response | None = None
     for attempt in range(max_attempts):
-        resp = client.request(method, url, **kwargs)
+        is_last = attempt == max_attempts - 1
+        try:
+            resp = client.request(method, url, **kwargs)
+        except httpx.TransportError:
+            # Dropped connections, DNS blips and read timeouts are the MOST
+            # common transient failures in a daily cron — far more common than
+            # a 503. Measured 2026-08-09: before this branch existed a 503 got
+            # four attempts and a ConnectError got exactly one. One unretried
+            # blip costs a repo its day, which resets the P0 gate's seven.
+            # httpx.TransportError covers Connect/Read/Write/Pool timeouts,
+            # NetworkError, ProtocolError and ProxyError — the whole transient
+            # network family — while leaving HTTPStatusError and InvalidURL to
+            # fail immediately, as they should.
+            if is_last:
+                raise
+            time.sleep(backoff * (2 ** attempt))
+            continue
+
         wait = _retry_after_seconds(resp)
         rate_limited = (resp.status_code in RATE_LIMIT_STATUS
                         and _looks_rate_limited(resp))
@@ -105,7 +122,7 @@ def request_with_retry(client: httpx.Client, method: str, url: str,
             resp.raise_for_status()
             return resp
         last = resp
-        if attempt < max_attempts - 1:
+        if not is_last:
             if wait is None:
                 wait = (RATE_LIMIT_FALLBACK_WAIT_S if rate_limited
                         else backoff * (2 ** attempt))

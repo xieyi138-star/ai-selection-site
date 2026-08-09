@@ -44,10 +44,21 @@ def run(engine: Engine, config_path: str | Path,
     # host it talks to, so a single shared client would post the GitHub bearer
     # token to pypistats.org, api.npmjs.org and hub.docker.com on every daily
     # run. None of those needs authentication at all.
-    with httpx.Client(headers=gh_headers, timeout=60) as gh_client, \
-            httpx.Client(timeout=60) as public_client:
+    # follow_redirects=False is already httpx's default; set it explicitly on
+    # BOTH clients so the token-isolation property above does not silently
+    # depend on that default staying put in a future httpx version — a
+    # redirect followed by gh_client could hand the GitHub bearer token to
+    # whatever host it was redirected to.
+    with httpx.Client(headers=gh_headers, timeout=60, follow_redirects=False) as gh_client, \
+            httpx.Client(timeout=60, follow_redirects=False) as public_client:
         for spec in specs:
             slug = f"{spec.owner}/{spec.name}"
+            # Accumulate all three collectors into one `values` dict and write
+            # once. A partial write (e.g. after github_activity succeeds but
+            # downloads throws) would leave today's row present for this repo,
+            # and the P0 gate checks row PRESENCE, not metric completeness —
+            # it would count the day as covered while a collector is silently
+            # broken. All-or-nothing per repo per day is what keeps the gate honest.
             try:
                 values: dict[str, float] = {}
                 values.update(github_activity.collect(gh_client, spec.owner, spec.name,

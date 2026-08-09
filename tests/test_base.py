@@ -59,6 +59,43 @@ def test_secondary_rate_limit_403_is_retried_and_obeys_retry_after(monkeypatch):
 
 
 @respx.mock
+def test_transport_errors_are_retried_like_a_5xx(monkeypatch):
+    """A dropped connection or DNS blip is the most common transient failure in
+    a daily cron, and it used to get exactly one attempt while a 503 got four.
+    One unretried blip costs a repo its day, which resets the P0 gate's seven."""
+    monkeypatch.setattr(time, "sleep", lambda _s: None)
+    calls = {"n": 0}
+
+    def flaky(request):
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise httpx.ConnectError("simulated connection failure")
+        return httpx.Response(200, json={"ok": True})
+
+    respx.get("https://api.example/flaky").mock(side_effect=flaky)
+    with httpx.Client() as c:
+        assert request_json(c, "GET", "https://api.example/flaky") == {"ok": True}
+    assert calls["n"] == 3  # recovered, not abandoned on the first failure
+
+
+@respx.mock
+def test_a_persistent_transport_error_still_fails_loudly(monkeypatch):
+    """Retrying must not become swallowing: a host that is genuinely gone has
+    to surface, not be reported as a quiet zero."""
+    monkeypatch.setattr(time, "sleep", lambda _s: None)
+    calls = {"n": 0}
+
+    def dead(request):
+        calls["n"] += 1
+        raise httpx.ConnectError("host is gone")
+
+    respx.get("https://api.example/dead").mock(side_effect=dead)
+    with httpx.Client() as c, pytest.raises(httpx.ConnectError):
+        request_json(c, "GET", "https://api.example/dead", max_attempts=3)
+    assert calls["n"] == 3  # spent the whole budget first
+
+
+@respx.mock
 def test_bare_403_fails_immediately_instead_of_being_retried():
     """A dead token must surface as an error, not be disguised as slowness."""
     route = respx.get("https://api.example/forbidden").mock(
