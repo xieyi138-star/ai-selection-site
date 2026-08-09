@@ -3,7 +3,6 @@ test suite (collectors are mocked) and silently zeroes a repo's adoption axis.""
 from __future__ import annotations
 
 import argparse
-import sys
 
 import httpx
 
