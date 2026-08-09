@@ -2376,7 +2376,7 @@ git commit -m "ci: weekly quickstart runs with p1a gate"
 **Interfaces:**
 - Consumes: `aisel.models.MetricDaily` / `QuickstartRun`（Task 1）
 - Produces:
-  - `aisel.scoring.axes.THRESHOLDS: dict[str, dict[str, float]]` — 各轴分级阈值，**由 Task 12 Step 5 的标定结果填入**
+  - `aisel.scoring.axes.THRESHOLDS: dict[str, dict[str, float]] | None` — 各轴分级阈值，**初值必须是 `None`**，由 Task 12 Step 5 的标定结果填入。未标定时 `rate_all` 抛 `RuntimeError` 而不是静默出错
   - `aisel.scoring.axes.latest_metrics(engine, repo_id) -> dict[str, float]`
   - `aisel.scoring.axes.rate_all(metrics: dict[str, float], run_status: str | None) -> dict[str, str]` — 返回 `{"adoption": "strong|moderate|weak|unknown", "alive": ..., "responsive": ..., "runnable": "pass|fail|unknown"}`
 
@@ -2421,6 +2421,14 @@ def test_runnable_mirrors_run_status():
     assert rate_all({}, run_status=None, thresholds=TH)["runnable"] == "unknown"
 
 
+def test_uncalibrated_thresholds_raise_instead_of_silently_misrating(monkeypatch):
+    """Placeholder thresholds would rate every repo wrong and no test would see it."""
+    import aisel.scoring.axes as axes_mod
+    monkeypatch.setattr(axes_mod, "THRESHOLDS", None)
+    with pytest.raises(RuntimeError, match="not calibrated"):
+        rate_all({"downloads_pypi_30d": 1.0}, run_status="pass")
+
+
 @pytest.mark.parametrize("value,lower_better,expected", [
     (200000.0, False, "strong"),
     (50000.0, False, "moderate"),
@@ -2457,12 +2465,11 @@ from aisel.models import MetricDaily, QuickstartRun
 UNKNOWN = "unknown"
 NO_SAMPLE = -1.0
 
-# Filled in by scripts/calibrate.py against real data — see Task 12 Step 5.
-THRESHOLDS: dict[str, dict[str, float]] = {
-    "adoption":   {"strong": 0.0, "moderate": 0.0},
-    "alive":      {"strong": 0.0, "moderate": 0.0},
-    "responsive": {"strong": 0.0, "moderate": 0.0},
-}
+# Calibrated against real data by scripts/calibrate.py (Task 12 Step 5).
+# Deliberately None until then: placeholder zeros would silently rate every repo
+# "strong" on higher-is-better axes and "weak" on lower-is-better ones, and the
+# injected-threshold tests would never catch it. Fail loudly instead.
+THRESHOLDS: dict[str, dict[str, float]] | None = None
 
 DOWNLOAD_METRICS = ("downloads_pypi_30d", "downloads_npm_30d")
 
@@ -2504,7 +2511,11 @@ def latest_run_status(engine: Engine, repo_id: int) -> str | None:
 
 def rate_all(metrics: dict[str, float], run_status: str | None,
              thresholds: dict[str, dict[str, float]] | None = None) -> dict[str, str]:
-    th = thresholds or THRESHOLDS
+    th = thresholds if thresholds is not None else THRESHOLDS
+    if th is None:
+        raise RuntimeError(
+            "axis thresholds are not calibrated — run scripts/calibrate.py and "
+            "set THRESHOLDS in aisel/scoring/axes.py (plan Task 12 Step 5)")
 
     downloads = [metrics[k] for k in DOWNLOAD_METRICS if k in metrics]
     if downloads:
@@ -2537,7 +2548,7 @@ def rate_all(metrics: dict[str, float], run_status: str | None,
 - [ ] **Step 4: 跑测试确认通过**
 
 Run: `python -m pytest tests/test_axes.py -v`
-Expected: 10 passed
+Expected: 11 passed
 
 - [ ] **Step 5: 写 `scripts/calibrate.py` 并用真实数据定阈值**
 
@@ -2597,7 +2608,7 @@ Run: `AISEL_DB_URL=sqlite:///data/aisel.db python scripts/calibrate.py`
 - 「越大越好」的轴：`strong = p75`，`moderate = p25`
 - 「越小越好」的轴：`strong = p25`，`moderate = p75`
 
-把算出的数字填进 `axes.py` 的 `THRESHOLDS`，并在该常量上方用注释记下标定日期与当时的 n 值。
+把 `axes.py` 里的 `THRESHOLDS = None` 替换为算出的三轴字典，并在该常量上方用注释记下标定日期与当时的 n 值。替换后 `test_uncalibrated_thresholds_raise_instead_of_silently_misrating` 仍须通过（它用 monkeypatch 强制置 None，不依赖模块初值）。
 
 - [ ] **Step 6: 提交**
 
@@ -3028,9 +3039,14 @@ def test_avoid_entries_are_visually_separated_from_primary(tmp_path):
     assert md.index("Primary") < md.index("Avoid")
 
 
-def test_quickstart_result_is_shown(tmp_path):
+def test_quickstart_column_carries_each_repos_own_run_result(tmp_path):
     md = render(_setup(tmp_path), "rag")
-    assert "pass" in md and "fail" in md
+    # table row layout: | slug | adoption | alive | responsive | runnable | confidence |
+    rows = {line.split("|")[1].strip(): line.split("|")[5].strip()
+            for line in md.splitlines()
+            if line.startswith("| ") and "/" in line}
+    assert rows["run-llama/llama_index"] == "pass"
+    assert rows["stale/oldrag"] == "fail"
 ```
 
 - [ ] **Step 2: 跑测试确认失败**
