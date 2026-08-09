@@ -6,20 +6,20 @@ does the four-axis judgement, calibrated on real numbers, produce conclusions a
 developer would recognise as sensible? Finding out now costs a script; finding
 out after P2 costs a site.
 
-Thresholds are calibrated here exactly as the plan specifies:
-  higher-is-better -> strong = p75, moderate = p25
-  lower-is-better  -> strong = p25, moderate = p75
-Sentinels (-1 no sample, 9999 never released) are excluded before quantiles.
+It answered that question by failing it. The plan specified quantile-calibrated
+thresholds (higher-is-better -> strong = p75, moderate = p25; lower-is-better
+the mirror image). Run against the real forty repos, that scheme labelled 17 of
+them "avoid" — including pgvector, Chroma, Milvus, FAISS and LlamaIndex —
+because ranking in the bottom quartile of a list of good tools is not the same
+thing as being bad. See THRESHOLDS below for what replaced it.
 """
 from __future__ import annotations
 
 import sqlite3
-import statistics
 import sys
 
 NO_SAMPLE = -1.0
 NEVER_RELEASED = 9999.0
-SENTINELS = {NO_SAMPLE, NEVER_RELEASED}
 BAND_RANK = {"unknown": 0, "weak": 1, "moderate": 2, "strong": 3}
 
 HIGHER_BETTER = {
@@ -28,10 +28,6 @@ HIGHER_BETTER = {
     "adoption_docker": "dockerhub_pulls_total",
     "alive_commits": "commits_90d",
     "alive_bus": "contributors_90d",
-}
-LOWER_BETTER = {
-    "alive_release": "days_since_last_release",
-    "responsive_latency": "issue_first_response_p50_hours",
 }
 
 
@@ -53,20 +49,37 @@ def close_ratio(m: dict[str, float]) -> float | None:
     return None if opened <= 0 else m.get("issues_closed_90d", 0.0) / opened
 
 
+# ABSOLUTE thresholds. Each line answers a question a developer would actually
+# ask, and means the same thing whoever else is on the list. Quantiles of the
+# roster were tried first and had to be abandoned: they force ~25% of repos into
+# "weak" on every axis BY CONSTRUCTION, so a list of forty good tools still
+# produces ten "avoid" verdicts. pgvector came out as "avoid" because a mature
+# Postgres extension does not commit as often as a hyperactive AI framework —
+# that is maturity, not death.
+THRESHOLDS: dict[str, dict[str, float]] = {
+    # "Has it shipped anything lately?" A year of silence on a tool people
+    # depend on is a real signal; a quiet quarter is not.
+    "alive_release":  {"strong": 90.0, "moderate": 365.0},
+    # "Is anyone still working on it?" Zero commits in a quarter is dormant.
+    "alive_commits":  {"strong": 20.0, "moderate": 1.0},
+    # "What happens if the maintainer stops?" One contributor is bus factor 1.
+    "alive_bus":      {"strong": 5.0, "moderate": 2.0},
+    # "If I open an issue, when do I hear back?" A day, a week, or worse.
+    "responsive_latency": {"strong": 24.0, "moderate": 168.0},
+    # "Do issues actually get resolved?" Busy repos close a smaller share, so
+    # this line is deliberately forgiving.
+    "responsive_close_ratio": {"strong": 0.40, "moderate": 0.10},
+    # Real installs per month. Meaningful on their own scale, per channel.
+    "adoption_pypi":   {"strong": 1_000_000.0, "moderate": 50_000.0},
+    "adoption_npm":    {"strong": 1_000_000.0, "moderate": 50_000.0},
+    # Docker pulls are cumulative since the image existed, so the bar is higher.
+    "adoption_docker": {"strong": 10_000_000.0, "moderate": 500_000.0},
+}
+
+
 def calibrate(metrics) -> dict[str, dict[str, float]]:
-    th: dict[str, dict[str, float]] = {}
-    for band, metric in {**HIGHER_BETTER, **LOWER_BETTER}.items():
-        vals = sorted(m[metric] for m in metrics.values()
-                      if metric in m and m[metric] not in SENTINELS)
-        if len(vals) < 8:  # too few samples to calibrate a band honestly
-            continue
-        q = statistics.quantiles(vals, n=4)
-        th[band] = ({"strong": q[2], "moderate": q[0]} if band in HIGHER_BETTER
-                    else {"strong": q[0], "moderate": q[2]})
-    ratios = sorted(r for r in (close_ratio(m) for m in metrics.values()) if r is not None)
-    q = statistics.quantiles(ratios, n=4)
-    th["responsive_close_ratio"] = {"strong": q[2], "moderate": q[0]}
-    return th
+    """Absolute thresholds; the data is only used to report where they land."""
+    return THRESHOLDS
 
 
 def rate(value: float, band: dict[str, float], lower_better: bool) -> str:
@@ -123,13 +136,23 @@ def confidence(m: dict[str, float], r: dict[str, str]) -> str:
     return "low"
 
 
+AXIS_NAMES = ("adoption", "alive", "responsive")
+
+
 def recommend(rank: int, r: dict[str, str], conf: str) -> str:
+    """`avoid` is a strong word and needs a strong trigger.
+
+    The first version fired it on ANY single weak sub-signal, which labelled
+    pgvector, Chroma, Milvus, FAISS and LlamaIndex "do not use". A developer
+    reading that would stop trusting the whole page — and they would be right.
+    Two independent axes have to be weak before we say it.
+    """
     if conf == "low":
         return "insufficient_data"
-    if r["alive"] == "weak" or r["responsive"] == "weak":
+    weak = sum(r[a] == "weak" for a in AXIS_NAMES)
+    if weak >= 2:
         return "avoid"
-    if rank == 1 and r["runnable"] == "pass" and not any(
-            r[a] == "weak" for a in ("adoption", "alive", "responsive")):
+    if rank == 1 and weak == 0 and r["runnable"] != "fail":
         return "primary"
     return "conditional"
 
@@ -139,7 +162,7 @@ def main() -> int:
     metrics, repos = load(db)
     th = calibrate(metrics)
 
-    print("calibrated thresholds (from today's 40 repos)")
+    print("absolute thresholds (fixed lines, NOT derived from this roster)")
     for band in sorted(th):
         b = th[band]
         print(f"  {band:24} strong={b['strong']:>16,.2f}  moderate={b['moderate']:>16,.2f}")
