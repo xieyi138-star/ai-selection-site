@@ -92,3 +92,25 @@ def test_truncated_window_raises_rather_than_reporting_a_partial_count(monkeypat
             collect(c, "o", "n", today=dt.date(2026, 8, 9))
 
     assert route.call_count == gi.MAX_PAGES  # tried the full budget first
+
+
+@respx.mock
+def test_graphql_errors_payload_raises_a_diagnosable_message():
+    """GraphQL answers errors with HTTP 200 and a null data payload. Without an
+    explicit check this surfaced as a bare TypeError several frames from its
+    cause — correct but undiagnosable, which costs hours at 3am."""
+    respx.post(GQL).mock(return_value=httpx.Response(200, json={
+        "data": None,
+        "errors": [{"message": "Could not resolve to a Repository named 'o/nope'."}]}))
+    with httpx.Client() as c:
+        with pytest.raises(RuntimeError, match="Could not resolve to a Repository"):
+            collect(c, "o", "nope", today=dt.date(2026, 8, 9))
+
+
+@respx.mock
+def test_null_repository_without_an_errors_array_also_raises():
+    respx.post(GQL).mock(return_value=httpx.Response(
+        200, json={"data": {"repository": None}}))
+    with httpx.Client() as c:
+        with pytest.raises(RuntimeError, match="no repository"):
+            collect(c, "o", "gone", today=dt.date(2026, 8, 9))
