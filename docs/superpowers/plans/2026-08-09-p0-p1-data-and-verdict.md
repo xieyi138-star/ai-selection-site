@@ -388,7 +388,7 @@ class Verdict(Base):
 - [ ] **Step 7: 跑测试确认通过**
 
 Run: `python -m pytest tests/test_models.py -v`
-Expected: 3 passed
+Expected: 4 passed
 
 - [ ] **Step 8: 提交**
 
@@ -1121,6 +1121,7 @@ git commit -m "feat: http retry base, idempotent metric writes, github activity 
 import datetime as dt
 
 import httpx
+import pytest
 import respx
 
 from aisel.collectors.github_issues import collect
@@ -1185,6 +1186,30 @@ def test_counts_closed_issues_in_window():
         out = collect(c, "o", "n", today=dt.date(2026, 8, 9))
 
     assert out["issues_closed_90d"] == 1.0
+
+
+@respx.mock
+def test_truncated_window_raises_rather_than_reporting_a_partial_count():
+    """Exhausting MAX_PAGES before reaching the cutoff means every count is an
+    undercount — and the surviving sample is the NEWEST issues, which are
+    systematically less likely to be closed, so the close ratio would be biased
+    downward exactly for the busiest repos. Measured 2026-08-09: vllm 1773
+    issues/90d, llama.cpp 1281, ollama 675.
+    """
+    import aisel.collectors.github_issues as gi
+
+    # Every page: full, entirely in-window, and claiming another page follows.
+    page = {"data": {"repository": {"issues": {
+        "nodes": [_issue("2026-08-01T00:00:00Z", "2026-08-01T02:00:00Z")
+                  for _ in range(gi.PAGE_SIZE)],
+        "pageInfo": {"hasNextPage": True, "endCursor": "c"}}}}}
+    route = respx.post(GQL).mock(return_value=httpx.Response(200, json=page))
+
+    with httpx.Client() as c:
+        with pytest.raises(RuntimeError, match="raise MAX_PAGES"):
+            collect(c, "o", "n", today=dt.date(2026, 8, 9))
+
+    assert route.call_count == gi.MAX_PAGES  # tried the full budget first
 ```
 
 - [ ] **Step 2: 跑测试确认失败**
@@ -1208,7 +1233,14 @@ from aisel.collectors.base import request_json
 GQL = "https://api.github.com/graphql"
 WINDOW_DAYS = 90
 PAGE_SIZE = 100
-MAX_PAGES = 3          # up to 300 issues; plenty for a 90-day median
+# Must be high enough to actually reach the 90-day cutoff. Measured 2026-08-09:
+# vllm 1773 issues/90d, llama.cpp 1281, ollama 675 — a 3-page (300) cap would
+# silently truncate all three. Truncation is not merely "fewer samples": it
+# keeps only the NEWEST issues, which are systematically less likely to be
+# closed yet, so the close ratio that feeds the responsive axis would be biased
+# downward exactly for high-traffic repos. Pages are only fetched until the
+# cutoff is reached, so this ceiling costs nothing for the small repos.
+MAX_PAGES = 40
 NO_SAMPLE = -1.0
 
 QUERY = """
@@ -1253,6 +1285,7 @@ def collect(client: httpx.Client, owner: str, name: str,
     closed = 0
     no_response = 0
     cursor: str | None = None
+    covered = False
 
     for _ in range(MAX_PAGES):
         payload = request_json(
@@ -1276,8 +1309,18 @@ def collect(client: httpx.Client, owner: str, name: str,
                 no_response += 1
         page = issues["pageInfo"]
         if stop or not page["hasNextPage"]:
+            covered = True
             break
         cursor = page["endCursor"]
+
+    if not covered:
+        # Ran out of pages before reaching the cutoff. Every count below would
+        # understate the window, and the sample would be biased toward the
+        # newest (least-likely-closed) issues. Refuse to publish a truncated
+        # number as if it were measured.
+        raise RuntimeError(
+            f"{owner}/{name}: more than {MAX_PAGES * PAGE_SIZE} issues in the "
+            f"last {WINDOW_DAYS} days; raise MAX_PAGES rather than truncating")
 
     return {
         "issue_first_response_p50_hours": (
@@ -1291,7 +1334,7 @@ def collect(client: httpx.Client, owner: str, name: str,
 - [ ] **Step 4: 跑测试确认通过**
 
 Run: `python -m pytest tests/test_github_issues.py -v`
-Expected: 3 passed
+Expected: 4 passed
 
 - [ ] **Step 5: 对真实 repo 手工验一次并人工抽查**
 
@@ -1468,7 +1511,7 @@ def collect(client: httpx.Client, spec: RepoSpec,
 - [ ] **Step 4: 跑测试确认通过**
 
 Run: `python -m pytest tests/test_downloads.py -v`
-Expected: 3 passed
+Expected: 4 passed
 
 - [ ] **Step 5: 对真实包核账**
 
@@ -2043,7 +2086,7 @@ def validate_covers_top(quickstarts: dict[str, Quickstart],
 - [ ] **Step 4: 跑测试确认通过**
 
 Run: `python -m pytest tests/test_manifest.py -v`
-Expected: 3 passed
+Expected: 4 passed
 
 - [ ] **Step 5: 逐个 repo 填写 `config/quickstarts.yaml`**
 
@@ -2542,7 +2585,7 @@ if __name__ == "__main__":
 - [ ] **Step 5: 跑测试确认通过**
 
 Run: `python -m pytest tests/test_gate_p1a.py -v`
-Expected: 3 passed
+Expected: 4 passed
 
 - [ ] **Step 6: 写 `.github/workflows/quickstart.yml`**
 
@@ -3493,7 +3536,7 @@ def render(engine: Engine, use_case_id: str) -> str:
 - [ ] **Step 4: 跑测试确认通过**
 
 Run: `python -m pytest tests/test_stage_page.py -v`
-Expected: 3 passed
+Expected: 4 passed
 
 - [ ] **Step 5: 写 `scripts/build_pages.py`**
 
