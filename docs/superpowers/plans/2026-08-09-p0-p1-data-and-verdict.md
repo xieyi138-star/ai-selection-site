@@ -3792,6 +3792,10 @@ git commit -m "feat: ranked verdicts with confidence and evidence snapshot"
 
 > 盲测**不需要建站**。规格 §9 把建站放在 P1b 之后，正是为了避免在护城河被证实前投入前端。盲测发 markdown 渲染出的页面即可。
 
+> ⚠️ **交接约束（Task 5 重审提出，不得遗忘）**：Task 5 采集了 `downloads_{pypi,npm}_days_30d` / `_days_prev30d`，**目前没有任何代码消费它们**。一旦本页（或任何地方）展示 30d-vs-prev30d 趋势，**必须先检查 `days_prev30d == 30`；不满 30 天就不许显示趋势**，改为标注「history too short」。
+> 理由：不足 60 天历史的包，recent 窗口满、prev 窗口缺，平坦流量会渲染成暴涨。采集端已经把判断所需的信息交出来了，展示端不查就等于白采——而这恰恰是宪法第 2 条要防的那种「看起来合理、很好看、且是错的」数字。
+> 当前版本的环节页**不展示趋势**，所以这条尚未被触发；加趋势时必须同时加这个守卫。
+
 页面必须包含（缺一项即视为未完成）：
 1. 环节名与一句话说明
 2. **结论区**：primary / conditional / avoid / insufficient_data 分组呈现
