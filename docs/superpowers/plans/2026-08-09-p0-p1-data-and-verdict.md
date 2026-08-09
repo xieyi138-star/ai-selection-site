@@ -872,7 +872,7 @@ def request_with_retry(client: httpx.Client, method: str, url: str,
                        **kwargs) -> httpx.Response:
     """Retrying request that returns the Response, for callers needing headers.
 
-Expected: 6 passed
+    Nothing may bypass this: an unretried transient 5xx costs one repo a day of
     data, which breaks the P0 gate's 7-consecutive-days requirement and restarts
     the clock.
 
@@ -930,7 +930,7 @@ def write_metrics(engine: Engine, repo_id: int, date: dt.date,
 - [ ] **Step 4: 跑测试确认通过**
 
 Run: `python -m pytest tests/test_base.py -v`
-Expected: 4 passed
+Expected: 6 passed
 
 - [ ] **Step 5: 写失败的测试 `tests/test_github_activity.py`**
 
