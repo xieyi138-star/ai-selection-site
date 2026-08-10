@@ -22,15 +22,21 @@ def main() -> int:
 
     bad: list[str] = []
     signalless: list[str] = []
+    declared_count = {"pypi": 0, "npm": 0, "dockerhub": 0}
+    total = 0
 
     with httpx.Client(timeout=30, follow_redirects=True) as client:
         for spec in load_repos(args.config):
+            total += 1
             slug = f"{spec.owner}/{spec.name}"
             declared = {
                 "pypi": spec.pypi_package,
                 "npm": spec.npm_package,
                 "dockerhub": spec.dockerhub_repo,
             }
+            for kind, value in declared.items():
+                if value:
+                    declared_count[kind] += 1
             if not any(declared.values()):
                 signalless.append(slug)
                 continue
@@ -46,6 +52,23 @@ def main() -> int:
         print(f"NO-PACKAGE  {slug}  -> adoption axis will be 'unknown' (allowed, must be deliberate)")
     for line in bad:
         print(f"BAD  {line}")
+
+    # Coverage snapshot. Without this, a download metric that covers only 1 of
+    # 40 repos looks like a collector that silently failed, when in fact the
+    # collector ran exactly as configured -- it only queries a registry when a
+    # package name is declared (see collectors/downloads.py: `if
+    # spec.pypi_package:`), and a genuine fetch failure raises rather than
+    # skipping. Printing the denominator turns "is this broken?" into a fact
+    # you can read off, instead of an investigation.
+    print("\nDeclared-package coverage (this is CONFIG, not collector health):")
+    for kind in ("pypi", "npm", "dockerhub"):
+        n = declared_count[kind]
+        print(f"  {kind:<11} {n:>3} / {total} repos declare a name"
+              f"  -> only these {n} get downloads_{kind}* rows")
+    print("  A low number here means the name was never declared, NOT that the"
+          " fetch failed;")
+    print("  a failed fetch aborts the run instead of writing nothing.")
+
     print(f"\n{len(bad)} bad, {len(signalless)} without any package")
     return 1 if bad else 0
 
